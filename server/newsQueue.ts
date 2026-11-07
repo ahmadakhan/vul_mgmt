@@ -17,7 +17,8 @@ import {
   selectUnnotifiedArticles,
   type ConsolidatedNewsItem,
 } from './newsEmail.ts';
-import { activeClaims, attachClaimsToJob, claimItems, claimsForJob, releaseUnattachedClaims } from './deliveryClaims.ts';
+import { activeClaims, attachClaimsToJob, claimItems, claimsForJob, reconcileDuplicateOutboxClaims } from './deliveryClaims.ts';
+import { uniqueEnabledEmailRecipients } from './emailRecipients.ts';
 
 /**
  * True when `db` is a pool (no transaction open) rather than a checked-out
@@ -208,10 +209,10 @@ export async function queueConsolidatedNews(
   deps: NewsQueueDeps,
 ): Promise<NewsQueueResult> {
   const result: NewsQueueResult = { emailsQueued: 0, articlesIncluded: 0, articlesSuppressed: 0 };
-  const selected = recipients.filter(
+  const selected = uniqueEnabledEmailRecipients(recipients.filter(
     (recipient) =>
       recipient.enabled && (recipient.deliveryGroup === 'SECURITY_TEAM' || recipient.deliveryGroup === undefined),
-  );
+  ));
   if (!selected.length || !matches.length) return result;
   const assetNameFor = (assetId: string) =>
     matches.find((match) => match.assetId === assetId)?.assetName || assetId;
@@ -222,7 +223,7 @@ export async function queueConsolidatedNews(
   );
   if (!items.length) return result;
   const articleRecord = new Map(items.map((item) => [item.article.id, item.article] as const));
-  const recipientIds = selected.map((recipient) => recipient.id);
+  const recipientIds = recipients.map((recipient) => recipient.id);
   const notified = await alreadyNotified(db, recipientIds, articleRecord);
   // Durable per-recipient claims (AUD-002). `alreadyNotified` is the read side;
   // the claim written in the enqueue transaction is what makes two concurrent
@@ -235,8 +236,19 @@ export async function queueConsolidatedNews(
   );
   // A recipient receives one consolidated news email per pipeline run.
   for (const recipient of selected) {
-    const own = selectUnnotifiedArticles(items, recipient.id, notified.get(recipient.id) || new Set()).filter(
-      (item) => !claimed.get(recipient.id)?.has(newsArticleIdentity(item.article)),
+    // Existing claims may belong to another recipient record for the same
+    // physical mailbox; union them before deciding an article is new.
+    const aliases = recipients.filter((candidate) =>
+      candidate.email.trim().toLowerCase() === recipient.email.trim().toLowerCase());
+    const notifiedForMailbox = new Set<string>();
+    const claimedForMailbox = new Set<string>();
+    for (const alias of aliases) {
+      for (const key of notified.get(alias.id) ?? [])
+        notifiedForMailbox.add(newsNotifiedKey(recipient.id, key.slice(alias.id.length + 1)));
+      for (const key of claimed.get(alias.id) ?? []) claimedForMailbox.add(key);
+    }
+    const own = selectUnnotifiedArticles(items, recipient.id, notifiedForMailbox).filter(
+      (item) => !claimedForMailbox.has(newsArticleIdentity(item.article)),
     );
     if (!own.length) {
       result.articlesSuppressed += items.length;
@@ -307,16 +319,11 @@ export async function queueConsolidatedNews(
         advisoryId: `NEWS:${ownedArticleIds.join(',')}`.slice(0, 512),
       });
       if (!id) {
-        // An identical message already exists under this dedupe key. Keep the
-        // claims with the existing QUEUED/SENDING job; only release them when
-        // the prior job FAILED without a confirmed transport acceptance, in
-        // which case `enqueue` re-opened it as this run's job.
-        const prior = await tx.query<{ status: string }>(
-          `SELECT status FROM outbox WHERE dedupe_key=$1`,
-          [`news:${recipient.id}:${articleSetFingerprint(ownedArticleIds)}:email:${recipient.id}`],
+        await reconcileDuplicateOutboxClaims(
+          tx,
+          `news:${recipient.id}:${articleSetFingerprint(ownedArticleIds)}:email:${recipient.id}`,
+          ownedRequests,
         );
-        if (prior.rows[0]?.status === 'FAILED')
-          await releaseUnattachedClaims(tx, ownedRequests);
         return null;
       }
       await attachClaimsToJob(tx, id, ownedRequests);

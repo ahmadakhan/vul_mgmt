@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Advisory, EmailRecipient, Finding, IntelligenceArticle, IntelligenceMatch } from '../src/types/index.ts';
+import { applyJobEdits, findingHtmlAttachment, type Job } from '../server/delivery.ts';
+import { uniqueEnabledEmailRecipients } from '../server/emailRecipients.ts';
 import {
   consolidateNewsMatches,
   newsArticleIdentity,
@@ -328,4 +330,30 @@ test('a previously queued legacy article URL suppresses a new syndication id', (
   const legacyReceipt = new Set([newsNotifiedKey('r1', newsArticleIdentity(oldArticle))]);
   assert.equal(selectUnnotifiedArticles(items, 'r1', legacyReceipt).length, 0);
   assert.equal(selectUnnotifiedArticles(items, 'r2', legacyReceipt).length, 1);
+});
+
+test('the attachment is byte-identical to the edited HTML, including inline CSS and every finding', () => {
+  const first = finding({ id: 'f1', cveId: 'CVE-2026-10001' });
+  const second = finding({ id: 'f2', cveId: 'CVE-2026-10002' });
+  const doc = renderFindingsDocument({ advisory: deliveryAdvisoryView(advisory, [first, second]), findings: [first, second] });
+  const queued = {
+    id: 'job-1', advisory_id: 'FINDINGS:batch-1', target_id: 'r1', channel: 'email',
+    dedupe_key: 'findings:batch-1:email:r1', attempts: 0,
+    payload: { subject: doc.subject, text: doc.text, html: doc.html, cveIds: [first.cveId, second.cveId] },
+    edits: { reviewerComment: 'Confirm vendor guidance before remediation' },
+  } as Job;
+  const edited = applyJobEdits(queued);
+  const attachment = findingHtmlAttachment(edited);
+  assert.ok(attachment);
+  assert.equal(attachment.contentType, 'text/html; charset=utf-8');
+  assert.deepEqual(attachment.content, Buffer.from(edited.payload.html!, 'utf8'));
+  assert.match(attachment.content.toString('utf8'), /CVE-2026-10001/);
+  assert.match(attachment.content.toString('utf8'), /CVE-2026-10002/);
+  assert.match(attachment.content.toString('utf8'), /Confirm vendor guidance/);
+});
+
+test('two recipient records for the same mailbox cannot create two jobs in one pass', () => {
+  const broad = { id: 'broad', email: 'SOC@example.com', enabled: true, subscriptionTier: 'ALL_SEVERITIES', deliveryGroup: 'SECURITY_TEAM' } as EmailRecipient;
+  const narrow = { ...broad, id: 'narrow', email: 'soc@example.com', subscriptionTier: 'CRITICAL_HIGH_ONLY' as const };
+  assert.deepEqual(uniqueEnabledEmailRecipients([narrow, broad]).map((item) => item.id), ['broad']);
 });

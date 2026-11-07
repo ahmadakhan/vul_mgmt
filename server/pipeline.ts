@@ -76,7 +76,6 @@ import {
   findingRevision,
   queueAdvisory,
   queueConsolidatedFindingNotifications,
-  queueZeroDayDigestNotification,
   recipientAllows,
   revision,
   type Job,
@@ -1794,26 +1793,14 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
       // the cost bound the cap protects still holds. The findings themselves stay
       // out of the normal dispatch path.
       if (digestPayloads.length) {
-        const digestRecipients = (await list<EmailRecipient>(db, 'recipients')).filter(
-          (r) => r.enabled && (r.deliveryGroup === 'SECURITY_TEAM' || r.deliveryGroup === undefined),
-        );
-        for (const { payload } of digestPayloads) {
-          zeroDayDigestNotificationsQueued += await queueZeroDayDigestNotification(
-            db,
-            payload,
-            digestRecipients,
-          );
-        }
+        // Keep zero-day evidence available in the UI without sending a third
+        // email repeating the same findings or source articles.
         await writeEvent(db, {
           category: 'MATCHING',
-          code: 'matching.zero_day_digests_queued',
-          message: 'Zero-day digests queued for the security team',
+          code: 'matching.zero_day_digests_recorded',
+          message: 'Zero-day evidence recorded for consolidated findings and news',
           runId: execution!.id,
-          context: {
-            digests: digestPayloads.length,
-            recipientsNotified: zeroDayDigestNotificationsQueued,
-            withheldMatches: zeroDayDigests.reduce((sum, digest) => sum + digest.matchCount, 0),
-          },
+          context: { digests: digestPayloads.length },
         });
       }
       const queueStarted = Date.now();
@@ -1828,13 +1815,13 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
       // per-match queue could not guarantee that: the matcher re-keys a match on
       // `hash(cveId || articleId)`, so the same story produced new rows (and new
       // emails) whenever it was re-correlated or syndicated through another feed.
-      if (rateLimitedMatches.length) {
+      if (intelligenceMatches.length) {
         const securityRecipients = await loadNewsRecipients(db);
         if (securityRecipients.length) {
           const articleMap = new Map(
             articles.map((article) => [article.id, article] as [string, IntelligenceArticle]),
           );
-          const news = await queueConsolidatedNews(db, rateLimitedMatches, articleMap, securityRecipients, {
+          const news = await queueConsolidatedNews(db, intelligenceMatches, articleMap, securityRecipients, {
             enqueue: async (input) =>
               enqueue(
                 input.db,
@@ -1890,7 +1877,7 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
             message: 'Consolidated security-news email dispatched to the security team',
             runId: execution!.id,
             context: {
-              matches: rateLimitedMatches.length,
+              matches: intelligenceMatches.length,
               recipientsNotified: news.emailsQueued,
               articlesIncluded: news.articlesIncluded,
               articlesAlreadySent: news.articlesSuppressed,
@@ -1909,8 +1896,10 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
       // what decides whether THIS recipient still needs THIS finding.
       const pending = vexEnforced.filter(
         (f) =>
-          ['QUEUED_FOR_DISPATCH', 'AUTO_DISPATCHED', 'REVIEW_REQUIRED'].includes(f.notificationStatus) &&
-          !f.advisoryId &&
+          // Status and advisoryId are global bookkeeping. A DELIVERED finding
+          // can still be new to a recipient added later. Only a recipient's
+          // durable delivery claim determines whether that mailbox is notified.
+          !['NOT_APPLICABLE', 'SUPPRESSED_VEX_NOT_AFFECTED', 'SECURITY_REJECTED'].includes(f.notificationStatus) &&
           !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(f.status),
       );
       // ML-guided finding order: use the trained importance ranker when

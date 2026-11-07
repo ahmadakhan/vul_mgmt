@@ -234,7 +234,7 @@ export interface ConsolidatedNewsDocument {
  * when the render is too large dropped every colour, card and link (AUD-004).
  * Instead the renderer keeps the full card layout for as many articles as fit
  * and lists the remainder in a styled summary table. The budget is well below
- * the PDF renderer's hard limit so the attachment path never has to degrade.
+ * common provider limits so HTML can be used unchanged across clients.
  */
 export const NEWS_HTML_MAX_BYTES = 1_500_000;
 
@@ -258,6 +258,8 @@ export function renderConsolidatedNewsEmailWithin(
   let low = 0;
   let high = items.length - 1;
   let best = renderConsolidatedNewsEmail(items.slice(0, 0), items.slice(0));
+  if (Buffer.byteLength(best.html, 'utf8') > maxBytes)
+    throw new Error('Consolidated news HTML exceeds the allowed size even in compact summary form');
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
     const candidate = renderConsolidatedNewsEmail(items.slice(0, middle), items.slice(middle));
@@ -276,8 +278,7 @@ export function renderConsolidatedNewsEmailWithin(
  *
  * All article titles, URLs, feed names and evidence strings are feed-controlled
  * and are escaped everywhere they appear. The document is intentionally
- * self-contained (inline styles, table-free single column) because it is
- * rendered to PDF with the same HTML when `ATTACH_ADVISORY_PDF` is enabled.
+ * self-contained (inline styles, single column) for HTML email clients.
  */
 export function renderConsolidatedNewsEmail(
   items: readonly ConsolidatedNewsItem[],

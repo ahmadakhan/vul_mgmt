@@ -432,7 +432,7 @@ export async function runDailyDigest(pool: pg.Pool): Promise<number> {
               !['NOT_APPLICABLE', 'SUPPRESSED_VEX_NOT_AFFECTED', 'DELIVERY_FAILED'].includes(
                 f.notificationStatus,
               ) &&
-              !['QUEUED_FOR_DISPATCH', 'AUTO_DISPATCHED', 'DELIVERED', 'REVIEW_REQUIRED'].includes(
+              !['QUEUED_FOR_DISPATCH', 'AUTO_DISPATCHED', 'DELIVERED', 'REVIEW_REQUIRED', 'DIGEST_BATCHED'].includes(
                 f.notificationStatus,
               ) &&
               !f.advisoryId,

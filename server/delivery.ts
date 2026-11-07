@@ -2,9 +2,7 @@
 import { describeError, writeEvent } from './events';
 import { classifyDeliveryError, computeRetryDelay, getMlRuntime } from './ml/integration.ts';
 import { advisoryEmail } from './advisoryEmail';
-import { advisoryFilename, renderAdvisoryPdf } from './pdf';
 import {
-  deliveryHtmlIsAttachable,
   htmlAttachmentIsAttachable,
   renderFindingsDocument,
   renderFindingsText,
@@ -28,9 +26,11 @@ import {
   claimItems,
   claimsForJob,
   markClaimsDelivered,
+  reconcileDuplicateOutboxClaims,
   releaseClaims,
   releaseUnattachedClaims,
 } from './deliveryClaims.ts';
+import { uniqueEnabledEmailRecipients } from './emailRecipients.ts';
 /**
  * Payload carried by a consolidated news delivery job.
  *
@@ -233,6 +233,20 @@ export interface EmailAttachment {
   filename: string;
   content: Buffer;
   contentType: string;
+}
+
+/** Exactly the same post-edit bytes as the HTML message part. */
+export function findingHtmlAttachment(content: Job): EmailAttachment | undefined {
+  if (!(isFindingDelivery(content.advisory_id) || content.advisory_id.startsWith('FINDINGS:')))
+    return undefined;
+  const html = content.payload.html;
+  if (!htmlAttachmentIsAttachable(html))
+    throw new Error('Finding email HTML is missing or exceeds the attachment limit; delivery deferred');
+  return {
+    filename: `${deliveryAttachmentStem(content)}.html`,
+    content: Buffer.from(html, 'utf8'),
+    contentType: 'text/html; charset=utf-8',
+  };
 }
 export interface EmailRetryPolicy {
   /** When false, a transient failure becomes terminal after the first attempt. */
@@ -528,53 +542,7 @@ export function webhookAllows(hook: WebhookEndpoint, finding: Finding): boolean 
  *  Failures degrade to HTML-only delivery instead of blocking the send.
  *
  *  The input is the *exact* HTML the message is sent with (the caller passes the
- *  output of `applyJobEdits`), so the attachment is the same document as the
- *  email — identical header, styling, colours, CVE cards, low-confidence notices
- *  and footer. Rendering from `payload.html` directly left an operator's edit
- *  (or a custom body override) visible in the email but absent from its
- *  attachment. */
-async function buildPdfAttachment(
-  content: Job,
-  config: Config,
-  db?: Db,
-): Promise<EmailAttachment | undefined> {
-  if (config.ATTACH_ADVISORY_PDF !== 'true' || !content.payload.html) return undefined;
-  // Only a document that is itself deliverable can be attached; the renderer
-  // has a hard size limit and an oversized body would fail the whole send.
-  if (!deliveryHtmlIsAttachable(content.payload.html)) return undefined;
-  // Operational self-healing alerts are infrastructure messages, not advisories;
-  // they must never carry a PDF attachment.
-  if (typeof content.advisory_id === 'string' && content.advisory_id.startsWith('SELFHEAL:')) return undefined;
-  if (content.payload.dailyDigest) return undefined;
-  try {
-    const pdf = await renderAdvisoryPdf(content.payload.html);
-    // The attachment is the document the email carries, so it is named after that
-    // document's identity. Synthetic bundles (news, consolidated findings,
-    // zero-day digest) get a readable stem instead of their internal prefix.
-    const filename = advisoryFilename(deliveryAttachmentStem(content));
-    return {
-      filename,
-      content: Buffer.from(pdf),
-      contentType: 'application/pdf',
-    };
-  } catch (error) {
-    if (db)
-      await writeEvent(db, {
-        category: 'EMAIL',
-        level: 'WARNING',
-        code: 'delivery.pdf_attachment_failed',
-        message: 'Advisory PDF attachment could not be generated; delivering HTML only',
-        context: {
-          jobId: content.id,
-          channel: content.channel,
-          advisoryId: content.advisory_id,
-          error: String((error as Error)?.message || error),
-        },
-      }).catch(() => undefined);
-    return undefined;
-  }
-}
-/**
+ /**
  * Attachment stem for a delivery.
  *
  * Real advisories keep their id. Synthetic bundles carry an internal prefix and
@@ -666,25 +634,11 @@ export function createMailSender(
       const settings = (db && (await get<AppSettings>(db, 'settings', 'main'))) || DEFAULT_SETTINGS;
       if (settings.emailEnabled === false) throw new Error('Email delivery is disabled by settings');
     }
-// Apply operator edits exactly once and build the attachment from the very
-    // body being sent, so the PDF is byte-identical to the email.
+// Apply operator edits once. The attachment contains the exact HTML body.
     const content = applyJobEdits(job);
-    const pdfAttachment = await buildPdfAttachment(content, config, db);
-    // The HTML file is just the bytes of the body, so it is gated by its own
-    // ceiling rather than the PDF renderer's layout limit.
-    const htmlAttachment: EmailAttachment | undefined =
-      (isFindingDelivery(content.advisory_id) || content.advisory_id.startsWith('FINDINGS:')) &&
-      htmlAttachmentIsAttachable(content.payload.html)
-        ? {
-            filename: `${deliveryAttachmentStem(content)}.html`,
-            content: Buffer.from(content.payload.html, 'utf8'),
-            contentType: 'text/html; charset=utf-8',
-          }
-        : undefined;
-    // The HTML file contains precisely the HTML sent as the email body.
-    const attachments = [htmlAttachment, pdfAttachment].filter(
-      (item): item is EmailAttachment => Boolean(item),
-    );
+    // Failure to attach is a delivery failure, never a silent HTML-only send.
+    const htmlAttachment = findingHtmlAttachment(content);
+    const attachments: EmailAttachment[] = htmlAttachment ? [htmlAttachment] : [];
     if (!isSmtpEmailProvider(saved.provider)) {
       const token = decrypt(saved.apiKey, encryptionKeys(config), `email-provider:${saved.provider}`);
       if (!token) throw new Error('Email provider token is missing');
@@ -1134,6 +1088,8 @@ export interface ConsolidatedFindingsDispatchOptions {
    * template, so the delivered email matches the editor preview.
    */
   template?: string;
+  /** Set only for Everyone recipients after Security-team acceptance. */
+  afterSecurityAcceptance?: boolean;
 }
 
 /**
@@ -1256,15 +1212,24 @@ export async function queueConsolidatedFindingNotifications(
     .filter((finding) => !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(finding.status))
     .sort((left, right) => left.cveId.localeCompare(right.cveId) || left.id.localeCompare(right.id));
   if (!unique.length) return 0;
-  const recipients = (options.recipients ?? (await list<EmailRecipient>(db, 'recipients'))).filter(
-    (recipient) => recipient.enabled,
-  );
+  // Keep all record aliases for historical receipt lookup, even disabled ones.
+  const configuredRecipients = await list<EmailRecipient>(db, 'recipients');
+  const recipients = uniqueEnabledEmailRecipients(options.recipients ?? configuredRecipients);
   if (!recipients.length) return 0;
+  const settings = (await get<AppSettings>(db, 'settings', 'main')) || DEFAULT_SETTINGS;
+  const securityRecipients = recipients.filter((recipient) => recipient.deliveryGroup !== 'EVERYONE');
+  // Defer only the individual findings that Security can actually receive.
+  // Otherwise an Everyone-only severity can get stranded forever.
+  const deferForFinding = (finding: Finding): boolean =>
+    Boolean(settings.deferEveryoneUntilSecurityDelivered) &&
+    !options.afterSecurityAcceptance &&
+    securityRecipients.some((recipient) => recipientAllows(recipient, finding));
+  const deliveryRecipients = recipients;
   // Read side of the claim: skip items this recipient already has. The write
   // side (`claimItems`) is what actually enforces uniqueness under concurrency.
   const alreadyClaimed = await activeClaims(
     db,
-    recipients.map((recipient) => recipient.id),
+    configuredRecipients.map((recipient) => recipient.id),
     'finding',
     unique.map((finding) => finding.id),
   );
@@ -1274,10 +1239,13 @@ export async function queueConsolidatedFindingNotifications(
   // template, and the template is never read per recipient.
   const template = options.template ?? (await loadAdvisoryTemplate(db));
   const documentCache = new Map<string, { payload: Job['payload']; priority: number }>();
-  for (const recipient of recipients) {
-    const claimedIds = alreadyClaimed.get(recipient.id) ?? new Set<string>();
+  for (const recipient of deliveryRecipients) {
+    const aliases = configuredRecipients.filter((candidate) =>
+      candidate.email.trim().toLowerCase() === recipient.email.trim().toLowerCase());
+    const claimedIds = new Set(aliases.flatMap((candidate) => [...(alreadyClaimed.get(candidate.id) ?? [])]));
     const permitted = unique.filter((finding) =>
-      recipientAllows(recipient, finding) && !claimedIds.has(finding.id));
+      recipientAllows(recipient, finding) && !claimedIds.has(finding.id) &&
+      (recipient.deliveryGroup !== 'EVERYONE' || !deferForFinding(finding)));
     if (!permitted.length) continue;
     const findingIds = permitted.map((finding) => finding.id);
     const bucket = consolidatedFindingBatchId(findingIds);
@@ -1351,17 +1319,11 @@ export async function queueConsolidatedFindingNotifications(
         ownedDocument.priority,
       );
       if (!id) {
-        // An identical message already exists under the same dedupe key. If it
-        // is QUEUED/SENDING, the claims stay with that job — a run that lost the
-        // race must not release its winner's claims. If it is terminally FAILED
-        // without a confirmed transport acceptance, `enqueue` has re-opened it as
-        // this run's job and the claims now belong to the new id.
-        const prior = await tx.query<{ status: string; id: string }>(
-          `SELECT id,status FROM outbox WHERE dedupe_key=$1`,
-          [`findings:${ownedDocument.payload.contentRevision}:email:${recipient.id}`],
+        await reconcileDuplicateOutboxClaims(
+          tx,
+          `findings:${ownedDocument.payload.contentRevision}:email:${recipient.id}`,
+          claim.granted,
         );
-        if (prior.rows[0] && prior.rows[0].status === 'FAILED')
-          await releaseUnattachedClaims(tx, claimsForJob(recipient.id, 'finding', ownedIds));
         return null;
       }
       await attachClaimsToJob(tx, id, claimsForJob(recipient.id, 'finding', ownedIds));
@@ -1434,13 +1396,17 @@ export async function queueZeroDayDigestNotification(
     `${lines.join('\n\n')}${sources}\n\n` +
     'This is applicability evidence, not a confirmed advisory. Confirm source authenticity and consult the vendor before remediation.';
   const articleIds = digest.articles.map((article) => article.id).sort();
-  // Identity is the set of source articles, not the match rows: a re-correlation
-  // of the same articles produces new match ids, and keying on those re-sent the
-  // whole digest to every recipient. A genuinely new article still changes the
-  // identity and sends a new digest.
-  const evidenceRevision = articleIds.join(',') || 'no-articles';
-  const identity = `zeroday:${digest.digestId}:${evidenceRevision}`;
-  const contentRevision = evidenceRevision;
+  // Two digests with no articles can still describe entirely different
+  // findings. Include the canonical source URL identities AND stable finding
+  // evidence instead of using a shared "no-articles" dedupe key.
+  const articleIdentities = [...new Set(digest.articles.map(newsArticleIdentity))].sort();
+  const findingIdentities = [...new Set(digest.findings.map((finding) =>
+    finding.findingId ? `finding:${finding.findingId}` :
+      `evidence:${finding.cveId || ''}:${finding.assetName}:${finding.evidence}`,
+  ))].sort();
+  const contentRevision = createHash('sha256')
+    .update(stableJson({ articleIdentities, findingIdentities })).digest('hex').slice(0, 24);
+  const identity = `zeroday:${digest.digestId}:${contentRevision}`;
   const payload: ZeroDayDigestPayload = {
     ...digest,
     articles: digest.articles.map((article) => ({ ...article, sourceFeeds: [...article.sourceFeeds] })),
@@ -1556,7 +1522,7 @@ export async function queueDigestAdvisory(
   render?: DigestRender,
   dispatchKey?: string,
 ): Promise<DigestQueueResult> {
-  const recipients = (await list<EmailRecipient>(db, 'recipients')).filter((recipient) => recipient.enabled);
+  const recipients = uniqueEnabledEmailRecipients(await list<EmailRecipient>(db, 'recipients'));
   const hooks = (await list<WebhookEndpoint>(db, 'webhooks')).filter((hook) => hook.enabled);
 
   const recipientBatches = new Map<string, Finding[]>();
@@ -1588,29 +1554,37 @@ export async function queueDigestAdvisory(
 
   for (const [recipientId, batch] of recipientBatches) {
     const recipient = recipients.find((candidate) => candidate.id === recipientId)!;
-    const view = digestView(union, batch);
-    const document = digestDocument(view, batch, render, generatedAt);
-    const payload = {
-      ...document,
-      cveIds: view.cveIds,
-      includedFindingIds: batch.map((finding) => finding.id),
-      ...deliveryRevisionEvidence(batch),
-      digestKey: stableDispatchKey,
-      contentRevision,
-      recipientEmail: recipient.email,
+    // Legacy buffered digests use the SAME recipient/finding claims as current
+    // consolidated findings. Without this, both paths can email the same CVE.
+    const enqueueOwned = async (tx: Db): Promise<boolean> => {
+      const requested = claimsForJob(recipient.id, 'finding', batch.map((f) => f.id));
+      const claimed = await claimItems(tx, requested);
+      if (!claimed.granted.length) return false;
+      const ids = new Set(claimed.granted.map((request) => request.itemId));
+      const owned = batch.filter((finding) => ids.has(finding.id));
+      const view = digestView(union, owned);
+      const document = digestDocument(view, owned, render, generatedAt);
+      const revision = advisoryRevision(view, owned);
+      const key = `${stableDispatchKey}:${revision}:email:${recipient.id}`;
+      const payload = {
+        ...document,
+        cveIds: view.cveIds,
+        includedFindingIds: owned.map((finding) => finding.id),
+        ...deliveryRevisionEvidence(owned),
+        digestKey: stableDispatchKey,
+        contentRevision: revision,
+        recipientEmail: recipient.email,
+      };
+      const id = await enqueue(tx, 'email', recipient.id, union.id, payload, key, 'QUEUED', priority);
+      if (!id) {
+        await reconcileDuplicateOutboxClaims(tx, key, claimed.granted);
+        return false;
+      }
+      await attachClaimsToJob(tx, id, claimed.granted);
+      return true;
     };
-    if (
-      await enqueue(
-        db,
-        'email',
-        recipient.id,
-        union.id,
-        payload,
-        `${stableDispatchKey}:${contentRevision}:email:${recipient.id}`,
-        'QUEUED',
-        priority,
-      )
-    ) {
+    const scheduled = isPool(db) ? await transaction(db, enqueueOwned) : await enqueueOwned(db);
+    if (scheduled) {
       jobs++;
       recipientCount++;
     }
@@ -1700,6 +1674,9 @@ export async function deliverNext(
     : { delayMs: 0, observed: false };
   const retryDelayObserved = observedDelay.delayMs;
   let transportAttempted = false;
+  // A previous ambiguous attempt must be resolved BEFORE any later transport
+  // rejection can establish that the whole job is safe to requeue.
+  let previousAttemptConfirmedNotDelivered = job.attempts === 1;
   // Declared before the try block: the failure path releases the per-recipient
   // claims of a consolidated finding batch, and that needs the job's findings.
   let declaredFindingIds: string[] = [];
@@ -2084,15 +2061,13 @@ export async function deliverNext(
           });
         }
         if (confirmation === 'unknown') {
-          // The provider could not answer (not allowlisted, console disabled, or
-          // an error). That is a transient condition, not proof of duplication:
-          // the job stays retryable and is re-confirmed on the next attempt. If
-          // the retry budget ends first it is committed FAILED, which is visible
-          // to the operator and never silently re-sent.
+          // Do not treat the next attempt's rejection as proof about an older
+          // ambiguous send. A provider lookup is required before resending.
           throw new Error(
             'Previous delivery outcome could not be confirmed yet; the resend is deferred until it can be',
           );
         }
+        previousAttemptConfirmedNotDelivered = confirmation === 'not-delivered';
       }
       // Record the attempt before the transport is contacted. A crash between
       // the provider accepting the message and the commit is then detectable,
@@ -2134,11 +2109,23 @@ export async function deliverNext(
           [job.id],
         );
       });
-      // Apply operator edits exactly once, before the transport sees the job.
-      // The PDF attachment is built from `payload.html` inside the sender, so
-      // this same value drives both the emailed body and the attachment.
+      // Prepare/validate the exact post-edit email before entering a possible
+      // transport attempt. Oversized/missing HTML is a LOCAL error, not proof
+      // that the provider may have accepted the message.
+      const preparedEmail = applyJobEdits(job);
+      findingHtmlAttachment(preparedEmail);
+      // Before any possible external send, persist UNKNOWN. A crash after
+      // provider acceptance is then safe to reconcile without a blind retry.
+      await transaction(pool, async (db) => {
+        await db.query(
+          `UPDATE outbox SET delivery_outcome='UNKNOWN' WHERE id=$1 AND delivery_outcome<>'ACCEPTED'`,
+          [job.id],
+        );
+      });
+      // Edits and attachment preflight were performed before the state was
+      // marked as an external attempt; send those same validated bytes.
       transportAttempted = true;
-      const result = await sendMail(applyJobEdits(job));
+      const result = await sendMail(preparedEmail);
       providerId = typeof result === 'string' ? result : result.id;
       if (typeof result !== 'string') emailProvider = result.provider;
     } else {
@@ -2282,10 +2269,10 @@ export async function deliverNext(
     //                          happened for this job on a prior attempt.
     const deliveryOutcome: 'NOT_ATTEMPTED' | 'REJECTED' | 'UNKNOWN' | 'ACCEPTED' = !error
       ? 'ACCEPTED'
-      : transportAttempted && transportRejected
-        ? 'REJECTED'
-        : transportAttempted || !error?.match(/^(Email delivery is disabled|not configured)/)
-          ? 'UNKNOWN'
+      : !previousAttemptConfirmedNotDelivered
+        ? 'UNKNOWN'
+        : transportAttempted
+          ? (transportRejected ? 'REJECTED' : 'UNKNOWN')
           : 'NOT_ATTEMPTED';
     await db.query(
       `UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now(),delivery_outcome=$6

@@ -1,4 +1,5 @@
 import type { Db } from './db.ts';
+import { newsArticleIdentity } from './newsEmail.ts';
 
 /**
  * Durable per-recipient delivery claims (AUD-001 / AUD-002).
@@ -306,7 +307,8 @@ export async function attachClaimsToJob(
   const result = await db.query(
     `UPDATE delivery_claims SET job_id=$4::uuid
       WHERE (recipient_id,kind,item_id) IN (SELECT * FROM unnest($1::text[],$2::text[],$3::text[]))
-        AND state='CLAIMED'`,
+        AND state='CLAIMED'
+        AND (job_id IS NULL OR job_id=$4::uuid)`,
     [
       unique.map((request) => request.recipientId),
       unique.map((request) => request.kind),
@@ -324,4 +326,61 @@ export function claimsForJob(
   itemIds: readonly string[],
 ): ClaimRequest[] {
   return itemIds.map((itemId) => ({ recipientId, kind, itemId }));
+}
+
+/**
+ * Repair newly acquired claims when the outbox dedupe key already exists.
+ * An outbox conflict is not proof of delivery: attach claims to the existing
+ * queued/unknown job, promote accepted receipts, and release only when no
+ * possible sending job holds them. Must run in the same transaction as claimItems.
+ */
+export async function reconcileDuplicateOutboxClaims(
+  db: Db,
+  dedupeKey: string,
+  requests: readonly ClaimRequest[],
+): Promise<void> {
+  if (!requests.length) return;
+  const prior = await db.query<{ id: string; status: string; delivery_outcome: string; target_id: string; channel: string; payload: Record<string, unknown> }>(
+    'SELECT id,status,delivery_outcome,target_id,channel,payload FROM outbox WHERE dedupe_key=$1 FOR UPDATE',
+    [dedupeKey],
+  );
+  const job = prior.rows[0];
+  if (!job) {
+    await releaseUnattachedClaims(db, requests);
+    return;
+  }
+  // A matching dedupe key alone is not sufficient evidence that the existing
+  // job actually carries every item. Reject inconsistent historical payloads.
+  const recorded = new Set<string>();
+  if (Array.isArray(job.payload.includedFindingIds)) {
+    for (const id of job.payload.includedFindingIds)
+      if (typeof id === 'string') recorded.add(`finding:${id}`);
+  }
+  const evidence = job.payload.newsEvidence as { articles?: unknown; article?: unknown } | undefined;
+  const articles = Array.isArray(evidence?.articles) ? evidence.articles : evidence?.article ? [evidence.article] : [];
+  for (const value of articles) {
+    if (!value || typeof value !== 'object') continue;
+    const article = value as { id?: unknown; url?: unknown };
+    recorded.add(`article:${newsArticleIdentity({
+      id: typeof article.id === 'string' ? article.id : '',
+      url: typeof article.url === 'string' ? article.url : '',
+    })}`);
+  }
+  if (job.channel !== 'email' || requests.some((request) =>
+    request.recipientId !== job.target_id || !recorded.has(`${request.kind}:${request.itemId}`))) {
+    throw new Error('Outbox dedupe collision does not contain the claimed recipient/items');
+  }
+  if (job.status === 'ACCEPTED' || job.delivery_outcome === 'ACCEPTED') {
+    await attachClaimsToJob(db, job.id, requests);
+    await markClaimsDelivered(db, requests, { jobId: job.id });
+  } else if (
+    ['QUEUED', 'SENDING', 'REVIEW'].includes(job.status) ||
+    (job.status === 'FAILED' && job.delivery_outcome === 'UNKNOWN')
+  ) {
+    // Preserve the claim even after its provisional expiry. The job might
+    // still send, or may already have sent without a confirmed receipt.
+    await attachClaimsToJob(db, job.id, requests);
+  } else {
+    await releaseUnattachedClaims(db, requests);
+  }
 }
