@@ -451,7 +451,6 @@ export const settingsSchema = z
     autoDispatchEnabled: z.boolean(),
     emailEnabled: z.boolean().default(true),
     autoDispatchConfidenceThreshold: z.number().int().min(0).max(100).default(90),
-    reviewConfidenceThreshold: z.number().int().min(0).max(100).default(0),
     // Unverifiable matches are review-only by design. Opt-in releases them so the
     // confidence threshold governs them too — pair with a threshold of 0 to
     // auto-dispatch every finding.

@@ -190,7 +190,10 @@ export async function sendProviderEmail(
           ...(config.replyTo ? { ReplyTo: config.replyTo } : {}),
           ...(encodedAttachments.length
             ? { Attachments: encodedAttachments.map((item) => ({
-                FileName: item.filename, ContentType: item.type, Base64Content: item.content,
+                // Mailjet's v3.1 schema spells this key `Filename`. `FileName`
+                // is not recognised, so the attachment was dropped or the
+                // request rejected.
+                Filename: item.filename, ContentType: item.type, Base64Content: item.content,
               })) }
             : {}),
           Headers: [

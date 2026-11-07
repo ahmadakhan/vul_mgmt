@@ -5,8 +5,11 @@ import { advisoryEmail } from './advisoryEmail';
 import { advisoryFilename, renderAdvisoryPdf } from './pdf';
 import {
   deliveryHtmlIsAttachable,
+  htmlAttachmentIsAttachable,
   renderFindingsDocument,
   renderFindingsText,
+  resolveAdvisoryTemplate,
+  type SavedTemplateRecord,
 } from './deliveryDocument.ts';
 import type pg from 'pg';
 import { runVulnerabilityPipeline } from '../src/engine/pipelineEngine';
@@ -667,9 +670,11 @@ export function createMailSender(
     // body being sent, so the PDF is byte-identical to the email.
     const content = applyJobEdits(job);
     const pdfAttachment = await buildPdfAttachment(content, config, db);
+    // The HTML file is just the bytes of the body, so it is gated by its own
+    // ceiling rather than the PDF renderer's layout limit.
     const htmlAttachment: EmailAttachment | undefined =
       (isFindingDelivery(content.advisory_id) || content.advisory_id.startsWith('FINDINGS:')) &&
-      deliveryHtmlIsAttachable(content.payload.html)
+      htmlAttachmentIsAttachable(content.payload.html)
         ? {
             filename: `${deliveryAttachmentStem(content)}.html`,
             content: Buffer.from(content.payload.html, 'utf8'),
@@ -1124,6 +1129,11 @@ export async function queueBulkNotificationAdvisory(
 export interface ConsolidatedFindingsDispatchOptions {
   /** Recipients to notify; defaults to every enabled recipient. */
   recipients?: EmailRecipient[];
+  /**
+   * Compiled advisory template to render with. Defaults to the operator's saved
+   * template, so the delivered email matches the editor preview.
+   */
+  template?: string;
 }
 
 /**
@@ -1148,6 +1158,8 @@ export function consolidatedFindingBatchId(findingIds: readonly string[]): strin
 export function consolidatedFindingsDocument(
   findings: Finding[],
   generatedAt: Date,
+  /** Compiled operator template (see `resolveAdvisoryTemplate`); default layout when omitted. */
+  template?: string,
 ): { advisory: Advisory; document: { subject: string; text: string; html: string } } {
   const batchId = consolidatedFindingBatchId(findings.map((finding) => finding.id));
   const advisory: Advisory = {
@@ -1166,8 +1178,13 @@ export function consolidatedFindingsDocument(
     affectedSystems: uniqueSorted(findings.map((finding) => finding.matchedAssetName)),
     isDigestBatch: findings.length > 1,
   };
-  const document = renderFindingsDocument({ advisory, findings, generatedAt });
+  const document = renderFindingsDocument({ advisory, findings, generatedAt, template });
   return { advisory, document: { subject: document.subject, text: document.text, html: document.html } };
+}
+
+/** Loads the operator's saved template, compiled; the same one the editor previews. */
+async function loadAdvisoryTemplate(db: Db): Promise<string> {
+  return resolveAdvisoryTemplate(await get<SavedTemplateRecord>(db, 'template', 'main'));
 }
 
 /** Rebuilds a queued consolidated batch's payload from its surviving findings. */
@@ -1175,9 +1192,10 @@ function consolidatedPayloadFor(
   advisory: Advisory,
   findings: Finding[],
   cveIds: string[],
+  template?: string,
 ): Job['payload'] {
   const generatedAt = new Date();
-  const { document } = consolidatedFindingsDocument(findings, generatedAt);
+  const { document } = consolidatedFindingsDocument(findings, generatedAt, template);
   const evidence = deliveryRevisionEvidence(findings);
   return {
     ...document,
@@ -1252,6 +1270,9 @@ export async function queueConsolidatedFindingNotifications(
   );
   let queued = 0;
   const generatedAt = new Date();
+  // Resolved once per pass: every recipient's document is rendered from the same
+  // template, and the template is never read per recipient.
+  const template = options.template ?? (await loadAdvisoryTemplate(db));
   const documentCache = new Map<string, { payload: Job['payload']; priority: number }>();
   for (const recipient of recipients) {
     const claimedIds = alreadyClaimed.get(recipient.id) ?? new Set<string>();
@@ -1262,7 +1283,7 @@ export async function queueConsolidatedFindingNotifications(
     const bucket = consolidatedFindingBatchId(findingIds);
     let built = documentCache.get(bucket);
     if (!built) {
-      const { advisory, document } = consolidatedFindingsDocument(permitted, generatedAt);
+      const { advisory, document } = consolidatedFindingsDocument(permitted, generatedAt, template);
       const evidence = deliveryRevisionEvidence(permitted);
       built = {
         payload: {
@@ -1997,7 +2018,12 @@ export async function deliverNext(
           // advisory accounting still recognises the delivery. The per-recipient
           // address is preserved: the rebuilt bundle still goes to this target.
           job.payload = {
-            ...consolidatedPayloadFor(revalidationView, surviving, declaredCveIds),
+            ...consolidatedPayloadFor(
+              revalidationView,
+              surviving,
+              declaredCveIds,
+              await loadAdvisoryTemplate(pool),
+            ),
             ...(job.payload.recipientEmail ? { recipientEmail: job.payload.recipientEmail } : {}),
           };
         } else if (!surviving.length) {

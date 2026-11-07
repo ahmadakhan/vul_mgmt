@@ -462,9 +462,6 @@ test('a partially contested batch still delivers the granted findings', { skip: 
 });
 
 test('review settings retain boundaries and reject invalid values', () => {
-  for (const value of [-1, 101, 70.5, NaN])
-    assert.equal(settingsSchema.safeParse({ ...DEFAULT_SETTINGS, reviewConfidenceThreshold: value }).success, false);
-  assert.equal(settingsSchema.parse(DEFAULT_SETTINGS).reviewConfidenceThreshold, 0);
   assert.equal(settingsSchema.parse({ ...DEFAULT_SETTINGS, emailEnabled: false }).emailEnabled, false);
   assert.equal(settingsSchema.safeParse({ ...DEFAULT_SETTINGS, emailEnabled: 'false' }).success, false);
 });

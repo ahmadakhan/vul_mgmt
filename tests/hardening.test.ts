@@ -580,14 +580,14 @@ test('enterprise hardening invariants', { skip: !database }, async (t) => {
       const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: url.href,
         APP_ORIGIN: 'http://localhost', ENCRYPTION_KEY: randomBytes(32).toString('base64') });
       await transaction(pool, (db) => applyCommand(db, config, {
-        action: 'settings.save', data: { reviewConfidenceThreshold: 65, emailEnabled: false }, actor: 'audit-operator', ipAddress: '192.0.2.12',
+        action: 'settings.save', data: { autoDispatchConfidenceThreshold: 65, emailEnabled: false }, actor: 'audit-operator', ipAddress: '192.0.2.12',
       }));
       const settings = await queryCollection<AuditLog>(pool, 'auditLogs', { limit: 10, offset: 0, search: 'settings.save' });
       const saved = settings.items.find((log) => log.actor === 'audit-operator');
       assert.equal(saved?.event, 'Workspace settings updated');
       assert.equal(saved?.context?.resourceId, 'main');
       assert.equal(saved?.context?.outcome, 'SUCCESS');
-      assert.deepEqual(saved?.context?.fields, ['emailEnabled', 'reviewConfidenceThreshold']);
+      assert.deepEqual(saved?.context?.fields, ['autoDispatchConfidenceThreshold', 'emailEnabled']);
       await Promise.all(Array.from({ length: 12 }, (_, index) => appendAudit(pool,
         'Feed credentials updated', `password=private-value; feed ${index}`, 'audit-operator', 'FEED', 'INFO', '192.0.2.12',
         { action: 'feed.save', resourceType: 'feed', resourceId: `source-${index}`, requestId: `request-audit-${index}`, outcome: 'SUCCESS' },

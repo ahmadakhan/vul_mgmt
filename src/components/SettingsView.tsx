@@ -48,7 +48,6 @@ const withProcessingDefaults = (value: AppSettings): AppSettings => ({
 const findingDispatchSettings = (value: AppSettings) => ({
   autoDispatchEnabled: value.autoDispatchEnabled,
   autoDispatchConfidenceThreshold: value.autoDispatchConfidenceThreshold ?? 90,
-  reviewConfidenceThreshold: value.reviewConfidenceThreshold ?? 0,
   autoDispatchUnverifiableMatches: value.autoDispatchUnverifiableMatches ?? false,
   reviewUnverifiableMatches: value.reviewUnverifiableMatches ?? false,
 });
@@ -256,7 +255,6 @@ export function SettingsView() {
   const [findingForm, setFindingForm] = useState(() => findingDispatchSettings(settings));
   const [confidenceDrafts, setConfidenceDrafts] = useState(() => ({
     queued: String(settings.autoDispatchConfidenceThreshold ?? 90),
-    review: String(settings.reviewConfidenceThreshold ?? 0),
   }));
   const [findingMessage, setFindingMessage] = useState('');
   const [findingSaveError, setFindingSaveError] = useState(false);
@@ -319,11 +317,9 @@ export function SettingsView() {
     (form.dailyDigest?.includeHealthReport ?? true) !== (settings.dailyDigest?.includeHealthReport ?? true) ||
     selfHealingForm.emailNotifications !== (settings.selfHealing?.emailNotifications ?? true);
   const queuedConfidenceError = confidenceInputError(confidenceDrafts.queued);
-  const reviewConfidenceError = confidenceInputError(confidenceDrafts.review);
-  const findingInvalid = Boolean(queuedConfidenceError || reviewConfidenceError);
+  const findingInvalid = Boolean(queuedConfidenceError);
   const findingDirty = JSON.stringify(findingForm) !== JSON.stringify(findingDispatchSettings(settings)) ||
-    confidenceDrafts.queued !== String(settings.autoDispatchConfidenceThreshold ?? 90) ||
-    confidenceDrafts.review !== String(settings.reviewConfidenceThreshold ?? 0);
+    confidenceDrafts.queued !== String(settings.autoDispatchConfidenceThreshold ?? 90);
   const securityDirty =
     securityForm.sessionTimeoutMins !== settings.securityPolicy.sessionTimeoutMins ||
     securityForm.minPasswordLen !== settings.securityPolicy.minPasswordLen ||
@@ -422,14 +418,12 @@ export function SettingsView() {
     const nextFindingForm = {
       ...findingForm,
       autoDispatchConfidenceThreshold: Number(confidenceDrafts.queued),
-      reviewConfidenceThreshold: Number(confidenceDrafts.review),
     };
     const saved = await updateSettings(nextFindingForm);
     if (saved) {
       setFindingForm(nextFindingForm);
       setConfidenceDrafts({
         queued: String(nextFindingForm.autoDispatchConfidenceThreshold),
-        review: String(nextFindingForm.reviewConfidenceThreshold),
       });
     }
     setFindingSaveError(!saved);
@@ -1282,32 +1276,6 @@ export function SettingsView() {
                           }
                         />
                       </ProcessingField>
-                      <ProcessingField
-                        id="processing-review-confidence"
-                        label="Limited-confidence notice threshold"
-                        unit="/ 100"
-                        hint="Every finding is dispatched. Findings below this confidence are annotated in the email with their confidence and the reason applicability needs confirmation. This setting never suppresses an email."
-                        error={reviewConfidenceError}
-                      >
-                        <input
-                          id="processing-review-confidence"
-                          type="number"
-                          min={0}
-                          max={100}
-                          step={1}
-                          required
-                          aria-invalid={Boolean(reviewConfidenceError)}
-                          aria-describedby={`processing-review-confidence-hint${reviewConfidenceError ? ' processing-review-confidence-error' : ''}`}
-                          className={field}
-                          value={confidenceDrafts.review}
-                          onChange={(event) =>
-                            setConfidenceDrafts({
-                              ...confidenceDrafts,
-                              review: event.target.value,
-                            })
-                          }
-                        />
-                      </ProcessingField>
                     </div>
                     <div className="processing-context">
                       <ShieldCheck size={17} aria-hidden="true" />
@@ -1387,7 +1355,6 @@ export function SettingsView() {
                           setFindingForm(findingDispatchSettings(settings));
                           setConfidenceDrafts({
                             queued: String(settings.autoDispatchConfidenceThreshold ?? 90),
-                            review: String(settings.reviewConfidenceThreshold ?? 0),
                           });
                           setFindingMessage('');
                           setFindingSaveError(false);

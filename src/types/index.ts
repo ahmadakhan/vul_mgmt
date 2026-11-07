@@ -1063,7 +1063,6 @@ export interface AppSettings {
    * The default (90) matches the previous hardcoded threshold.
    */
   autoDispatchConfidenceThreshold: number;
-  reviewConfidenceThreshold?: number;
   /**
    * When true, unverifiable matches (whose version range cannot be confirmed)
    * participate in the confidence threshold instead of being held for review

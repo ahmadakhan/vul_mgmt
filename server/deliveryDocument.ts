@@ -113,11 +113,39 @@ export function deliveryAdvisoryView(original: Advisory, findings: Finding[]): A
   };
 }
 
+/** The operator's saved template record (`records` kind `template`, id `main`). */
+export interface SavedTemplateRecord {
+  templateCustomization?: TemplateCustomization;
+  /** A hand-authored advisory template that replaces the generated layout. */
+  customAdvisoryTemplate?: string | null;
+}
+
+/**
+ * Resolves the compiled advisory template the operator designed.
+ *
+ * This is the same precedence the application state uses (`customAdvisoryTemplate`
+ * first, otherwise the compiled customization, otherwise the product default),
+ * so a delivered email is rendered from the template the editor previews. The
+ * consolidated finding path previously rendered from the built-in default, which
+ * made real emails differ from the preview in layout, colours and branding.
+ */
+export function resolveAdvisoryTemplate(record?: SavedTemplateRecord | null): string {
+  const custom = record?.customAdvisoryTemplate;
+  if (typeof custom === 'string' && custom.trim()) return custom;
+  return compileCustomizedTemplate(record?.templateCustomization ?? DEFAULT_TEMPLATE_CUSTOMIZATION);
+}
+
 export interface DeliveryDocumentInput {
   /** Advisory metadata for this recipient's view. */
   advisory: Advisory;
   /** Findings carried by this delivery, in the order they should render. */
   findings: Finding[];
+  /**
+   * Already-compiled advisory template (see `resolveAdvisoryTemplate`). Takes
+   * precedence over `templateCustomization` so callers that have the operator's
+   * saved template render from it.
+   */
+  template?: string;
   /** Operator-managed template customization used for the HTML body. */
   templateCustomization?: TemplateCustomization;
   /** Pinned render instant; one value per delivery. */
@@ -125,15 +153,22 @@ export interface DeliveryDocumentInput {
 }
 
 /**
- * Builds the one document used for an email body and its PDF attachment.
+ * Builds the one document used for an email body and its attachments.
+ *
+ * The text alternative carries the same limited-confidence notices as the HTML,
+ * each with its reason, so a plain-text client is told exactly what the HTML
+ * reader is told.
  */
 export function renderFindingsDocument(input: DeliveryDocumentInput): DeliveryDocument {
   const { advisory, findings } = input;
   const generatedAt = input.generatedAt ?? new Date();
-  const template = compileCustomizedTemplate(input.templateCustomization ?? DEFAULT_TEMPLATE_CUSTOMIZATION);
+  const template =
+    input.template ?? compileCustomizedTemplate(input.templateCustomization ?? DEFAULT_TEMPLATE_CUSTOMIZATION);
   const html = renderAdvisory(template, advisory, findings, { generatedAt });
   const email = advisoryEmail(advisory, html, findings.map(deliveryFindingDetail), { findings });
-  return { ...email, html: email.html ?? html, generatedAt };
+  const limited = limitedConfidenceLines(findings);
+  const text = limited.length ? `${email.text}\n\n${limited.join('\n')}` : email.text;
+  return { ...email, text, html: email.html ?? html, generatedAt };
 }
 
 export interface PlainTextSection {
@@ -160,16 +195,8 @@ export function renderFindingsText(
     `Created: ${advisory.createdDate}`,
   ];
   for (const section of sections) if (section.lines.length) lines.push('', `${section.heading}:`, ...section.lines);
-  const lowConfidence = findings.filter(isLowConfidence);
-  if (lowConfidence.length)
-    lines.push(
-      '',
-      'Limited confidence (confirm applicability before remediation):',
-      ...lowConfidence.map(
-        (finding) =>
-          `- ${finding.cveId} | ${finding.matchedAssetName} | ${confidenceLabel(finding)} | ${stripLine(finding.matchingEvidence)}`,
-      ),
-    );
+  const limited = limitedConfidenceLines(findings);
+  if (limited.length) lines.push('', ...limited);
   lines.push(
     '',
     'CVE IDs:',
@@ -191,6 +218,26 @@ export function renderFindingsText(
 const stripLine = (value: string | undefined) =>
   (value || '').replace(/[\r\n\t]+/g, ' ').replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, '').trim();
 
+/**
+ * Plain-text notice for findings whose match confidence is limited: the heading
+ * followed by one line per finding with its confidence and the reason. Empty when
+ * every finding is fully confident. Shared by every text alternative so the
+ * single-document and digest paths cannot word it differently.
+ */
+function limitedConfidenceLines(findings: readonly Finding[]): string[] {
+  const limited = findings.filter(isLowConfidence);
+  if (!limited.length) return [];
+  return [
+    'Limited confidence (confirm applicability before remediation):',
+    ...limited.map(
+      (finding) =>
+        `- ${finding.cveId} | ${finding.matchedAssetName} | ${confidenceLabel(finding)} | ${
+          stripLine(finding.matchingEvidence) || 'Applicability could not be fully verified'
+        }`,
+    ),
+  ];
+}
+
 const confidenceLabel = (finding: Finding) =>
   typeof finding.confidence === 'number' && Number.isFinite(finding.confidence)
     ? `match confidence ${Math.round(finding.confidence)}%`
@@ -209,3 +256,21 @@ export const deliveryHtmlIsAttachable = (html: string | undefined): html is stri
   typeof html === 'string' &&
   html.length > 0 &&
   Buffer.byteLength(html, 'utf8') <= DELIVERY_HTML_MAX_BYTES;
+
+/**
+ * Size ceiling for attaching the HTML document itself.
+ *
+ * The PDF renderer's 2 MB limit exists because Chromium has to lay the page out;
+ * an HTML attachment is just the bytes of the body, so tying it to that limit
+ * silently dropped the attachment for large digests (roughly 700+ findings). The
+ * ceiling is still bounded because the message carries the body, the attachment
+ * (base64, +33%) and optionally a PDF, and common providers reject a message
+ * above about 15 MB in total.
+ */
+export const HTML_ATTACHMENT_MAX_BYTES = 4_000_000;
+
+/** True when the exact email HTML can be attached as a file. */
+export const htmlAttachmentIsAttachable = (html: string | undefined): html is string =>
+  typeof html === 'string' &&
+  html.length > 0 &&
+  Buffer.byteLength(html, 'utf8') <= HTML_ATTACHMENT_MAX_BYTES;

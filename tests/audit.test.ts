@@ -36,8 +36,8 @@ test('audit formatting redacts credentials, bounds data and describes commands w
   assert.equal(auditText('x'.repeat(500), 100).length, 100);
   assert.equal(auditText('x\ud83d\ude00', 2), 'x\ufffd');
   assert.ok(!auditText('operator\u202eforged', 100).includes('\u202e'));
-  const context = auditContext({ action: 'settings.save', fields: ['reviewConfidenceThreshold', 'password', 'bad\nfield', 'password'] }, 'INFO');
-  assert.deepEqual(context.fields, ['password', 'reviewConfidenceThreshold']);
+  const context = auditContext({ action: 'settings.save', fields: ['autoDispatchConfidenceThreshold', 'password', 'bad\nfield', 'password'] }, 'INFO');
+  assert.deepEqual(context.fields, ['autoDispatchConfidenceThreshold', 'password']);
   assert.equal(context.outcome, 'RECORDED');
   const command = commandAudit('email.configure', 'main', { smtpPassword: 'do-not-log', fromEmail: 'private@example.com' });
   assert.equal(command.category, 'EMAIL');
@@ -59,7 +59,7 @@ test('audit context is tamper-evident without changing historical hashes', () =>
   assert.equal(verifyAuditChain([legacy]), true);
   const modern = chainAuditLogs([{ ...legacy, id: 'modern', context: {
     action: 'settings.save', resourceType: 'settings', resourceId: 'main', outcome: 'SUCCESS',
-    fields: ['reviewConfidenceThreshold'],
+    fields: ['autoDispatchConfidenceThreshold'],
   } }], legacy.hash)[0];
   assert.equal(verifyAuditChain([modern, legacy]), true);
   assert.equal(verifyAuditChain([{ ...modern, context: { ...modern.context!, resourceId: 'other' } }, legacy]), false);
