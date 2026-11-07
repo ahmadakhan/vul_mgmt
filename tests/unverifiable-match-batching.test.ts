@@ -9,7 +9,7 @@ import {
   queueZeroDayDigestNotification,
   type ZeroDayDigestPayload,
 } from '../server/delivery.ts';
-import { claimItems, claimsForJob, markClaimsDelivered, releaseClaims } from '../server/deliveryClaims.ts';
+import { claimItems, claimsForJob, markClaimsDelivered, releaseClaims, releaseUnattachedClaims } from '../server/deliveryClaims.ts';
 import { DEFAULT_SETTINGS } from '../shared/state.ts';
 import { loadConfig } from '../server/config.ts';
 import type { Requester } from '../server/network.ts';
@@ -252,9 +252,12 @@ test('a terminally failed delivery releases its claims so the finding is re-queu
     await put(pool, 'recipients', target.id, target);
     const entry = finding('CVE-2026-14001', 'f1', 'server-1', 'acme', 'widget');
     assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
-    // Simulate the terminal failure the delivery worker records: the job is
-    // marked FAILED without any transport acceptance and its claims are released.
-    await pool.query("UPDATE outbox SET status='FAILED', error='transport rejected'");
+    // Simulate the terminal failure the delivery worker records: the transport
+    // provably rejected the message, so the outcome is REJECTED and the claims
+    // are released by the finalize path.
+    await pool.query(
+      "UPDATE outbox SET status='FAILED', delivery_outcome='REJECTED', error='transport rejected'",
+    );
     const FAILED_JOB_HINT = (
       await pool.query<{ id: string }>("SELECT id FROM outbox WHERE advisory_id LIKE 'FINDINGS:%' LIMIT 1")
     ).rows[0]?.id;
@@ -270,6 +273,48 @@ test('a terminally failed delivery releases its claims so the finding is re-queu
     );
     const reopened = await pool.query<{ status: string }>('SELECT status FROM outbox');
     assert.equal(reopened.rows[0].status, 'QUEUED', 'the failed job is reopened, preserving its identity');
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('an UNKNOWN delivery outcome is never reopened without confirmation', { skip: !url }, async () => {
+  // AUD-007: a timeout / dropped connection means the prior attempt may have
+  // been accepted. The dedupe key must not release the job for a resend until
+  // the provider confirms the earlier attempt was not delivered.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', target.id, target);
+    const entry = finding('CVE-2026-16001', 'f1', 'server-1', 'acme', 'widget');
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
+    // The attempt reached the transport but the outcome is ambiguous.
+    await pool.query("UPDATE outbox SET status='FAILED', delivery_outcome='UNKNOWN'");
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [entry]),
+      0,
+      'an ambiguous transport failure is never auto-resent',
+    );
+    // Same for a job whose transport confirmed acceptance — a fact, never re-sent.
+    await pool.query("UPDATE outbox SET status='FAILED', delivery_outcome='ACCEPTED'");
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [entry]),
+      0,
+      'an accepted message is never re-sent',
+    );
+    // The claims stay held by the failed job either way; releasing them (as the
+    // finalize path does for a REJECTED outcome only) is what makes re-queuing
+    // possible, and even then only for NOT_ATTEMPTED/REJECTED outcomes.
+    const jobId = (
+      await pool.query<{ id: string }>("SELECT id FROM outbox LIMIT 1")
+    ).rows[0].id;
+    await pool.query("UPDATE outbox SET status='FAILED', delivery_outcome='REJECTED'");
+    await releaseClaims(pool, claimsForJob(target.id, 'finding', [entry.id]), { jobId });
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [entry]),
+      1,
+      'a confirmed rejection is re-queued once the finalize path released its claims',
+    );
     return true;
   });
   assert.ok(outcome, 'database-backed test ran');
@@ -644,4 +689,105 @@ test('delivery rechecks the recipient subscription before sending', { skip: !url
     assert.equal(row.status, 'FAILED');
     assert.match(row.error, /subscription/i);
   });
+});
+
+test('the delivery-claims backfill imports retained outbox history', { skip: !url }, async () => {
+  // AUD-010: previously delivered emails must become per-recipient claims, or
+  // an upgrade re-notifies everything the old build had already sent. The
+  // backfill is migration 039; this executes it against seeded outbox rows.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const analyst = recipient('r1', 'analyst@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', analyst.id, analyst);
+    // Two accepted historical batches for the analyst, and one still-queued one.
+    await pool.query(
+      `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,delivery_outcome)
+       VALUES(gen_random_uuid(),'hist-1','email','r1','FINDINGS:hist1',
+              $1::jsonb,'ACCEPTED','ACCEPTED')`,
+      [JSON.stringify({ includedFindingIds: ['f1', 'f2'] })],
+    );
+    await pool.query(
+      `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,delivery_outcome)
+       VALUES(gen_random_uuid(),'hist-2','email','r1','FINDINGS:hist2',
+              $1::jsonb,'ACCEPTED','ACCEPTED')`,
+      [JSON.stringify({ includedFindingIds: ['f2'] })],
+    );
+    await pool.query(
+      `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,delivery_outcome)
+       VALUES(gen_random_uuid(),'hist-3','email','r1','FINDINGS:hist3',
+              $1::jsonb,'QUEUED','NOT_ATTEMPTED')`,
+      [JSON.stringify({ includedFindingIds: ['f3'] })],
+    );
+    // A webhook job is never a finding receipt for an email recipient.
+    await pool.query(
+      `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,delivery_outcome)
+       VALUES(gen_random_uuid(),'hist-4','webhook','hook','FINDINGS:hist4',
+              $1::jsonb,'ACCEPTED','ACCEPTED')`,
+      [JSON.stringify({ includedFindingIds: ['f4'] })],
+    );
+    // Run the backfill (the migration runner skips applied versions, so execute
+    // the file directly and record the version to keep the schema consistent).
+    const { readFile } = await import('node:fs/promises');
+    const sql = await readFile(
+      new URL('../server/migrations/039_backfill_delivery_claims.sql', import.meta.url),
+      'utf8',
+    );
+    await pool.query(sql);
+
+    const claims = await pool.query<{ item_id: string; state: string }>(
+      "SELECT item_id,state FROM delivery_claims WHERE recipient_id='r1' AND kind='finding' ORDER BY item_id",
+    );
+    assert.deepEqual(
+      claims.rows.map((row) => [row.item_id, row.state]),
+      [
+        ['f1', 'DELIVERED'],
+        ['f2', 'DELIVERED'],
+        ['f3', 'CLAIMED'],
+      ],
+      'accepted history becomes a delivered receipt; queued history stays claimed; webhooks are ignored',
+    );
+
+    // The receipts actually suppress re-delivery for the analyst...
+    const f1 = finding('CVE-2026-17001', 'f1', 'server-1', 'acme', 'widget');
+    const f2 = finding('CVE-2026-17002', 'f2', 'server-2', 'acme', 'widget');
+    await put(pool, 'findings', 'f1', f1);
+    await put(pool, 'findings', 'f2', f2);
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [f1]), 0);
+    // ...while a NEW recipient is still eligible (the claim is per recipient).
+    const newcomer = recipient('r2', 'newcomer@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', newcomer.id, newcomer);
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [f1]),
+      1,
+      'a recipient the history does not cover still receives the finding',
+    );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('releaseUnattachedClaims frees only claims with no owning job', { skip: !url }, async () => {
+  const outcome = await withDatabase(async (pool) => {
+    const jobId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'unattached-test','email','r1','FINDINGS:u','{}'::jsonb,'QUEUED') RETURNING id`,
+      )
+    ).rows[0].id;
+    const request = claimsForJob('r1', 'finding', ['f1', 'f2']);
+    // f1 is owned by a real job; f2 was left behind by a rolled-back queue pass.
+    assert.equal((await claimItems(pool, [request[0]], { jobId })).granted.length, 1);
+    assert.equal((await claimItems(pool, [request[1]])).granted.length, 1);
+    // AUD-009: ownership is mandatory — the release without a job id is a
+    // compile error, and a wrong job id frees nothing.
+    assert.equal(await releaseClaims(pool, request, { jobId: randomUUID() }), 0);
+    assert.equal(await releaseUnattachedClaims(pool, request), 1, 'only the unattached claim is freed');
+    assert.equal(
+      (await pool.query("SELECT count(*)::int AS n FROM delivery_claims WHERE item_id='f1'")).rows[0].n,
+      1,
+      'the owned claim survives the unattached cleanup',
+    );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
 });

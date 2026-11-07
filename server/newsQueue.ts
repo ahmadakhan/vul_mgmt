@@ -17,7 +17,7 @@ import {
   selectUnnotifiedArticles,
   type ConsolidatedNewsItem,
 } from './newsEmail.ts';
-import { activeClaims, attachClaimsToJob, claimItems, claimsForJob, releaseClaims } from './deliveryClaims.ts';
+import { activeClaims, attachClaimsToJob, claimItems, claimsForJob, releaseUnattachedClaims } from './deliveryClaims.ts';
 
 /**
  * True when `db` is a pool (no transaction open) rather than a checked-out
@@ -141,7 +141,15 @@ export async function alreadyNotified(
   const currentIds = new Set(articleIds);
   const currentIdentities = new Set(identities);
   for (const row of queued.rows) {
-    const identity = row.identity || newsArticleIdentity({ id: row.article_id || '', url: row.url || '' });
+    // AUD-008: historical payloads carry identities produced by an older
+    // `newsArticleIdentity` (URL without its query string). When the original
+    // URL survives in the payload, recompute the identity with the CURRENT
+    // algorithm instead of trusting the stored one — otherwise an old
+    // hostname-and-path identity would never match a new identity that keeps
+    // meaningful query parameters, and the article would be re-sent.
+    const identity = row.url
+      ? newsArticleIdentity({ id: row.article_id || '', url: row.url })
+      : row.identity || newsArticleIdentity({ id: row.article_id || '', url: '' });
     if (!currentIds.has(row.article_id) && !currentIdentities.has(identity)) continue;
     const set = notified.get(row.target_id);
     if (row.article_id) set?.add(newsNotifiedKey(row.target_id, row.article_id));
@@ -308,7 +316,7 @@ export async function queueConsolidatedNews(
           [`news:${recipient.id}:${articleSetFingerprint(ownedArticleIds)}:email:${recipient.id}`],
         );
         if (prior.rows[0]?.status === 'FAILED')
-          await releaseClaims(tx, ownedRequests);
+          await releaseUnattachedClaims(tx, ownedRequests);
         return null;
       }
       await attachClaimsToJob(tx, id, ownedRequests);

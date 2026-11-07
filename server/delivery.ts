@@ -26,6 +26,7 @@ import {
   claimsForJob,
   markClaimsDelivered,
   releaseClaims,
+  releaseUnattachedClaims,
 } from './deliveryClaims.ts';
 /**
  * Payload carried by a consolidated news delivery job.
@@ -794,8 +795,8 @@ export async function enqueue(
   //    lookup inconclusive, prior attempt possibly accepted) are never re-opened
   //    here — they are held for the confirm-prior-delivery check on retry.
   const inserted = await db.query(
-    `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,priority,edits)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+    `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,priority,edits,delivery_outcome)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'NOT_ATTEMPTED')
      ON CONFLICT(dedupe_key) DO UPDATE SET
        advisory_id=EXCLUDED.advisory_id,
        payload=EXCLUDED.payload,
@@ -808,18 +809,20 @@ export async function enqueue(
        provider_id=NULL,
        locked_at=NULL,
        lock_token=NULL,
+       -- AUD-007: the reopen decision is the recorded delivery outcome, never
+       -- error-message text. A job whose transport provably rejected the message
+       -- (or never attempted one) may be re-opened; an UNKNOWN outcome means a
+       -- prior attempt may have been accepted and stays blocked pending the
+       -- confirm-prior-delivery check; ACCEPTED is a fact and is never re-sent.
+       delivery_outcome=EXCLUDED.delivery_outcome,
        updated_at=now()
      WHERE outbox.status='FAILED'
-       AND COALESCE(outbox.provider_id,'')=''
+       AND outbox.delivery_outcome IN ('NOT_ATTEMPTED','REJECTED')
        AND (
          COALESCE(outbox.error,'') LIKE '%no longer applicable%'
          OR (outbox.advisory_id LIKE 'UNVERIFIABLE:%' AND COALESCE(outbox.error,'') LIKE 'Review notification%')
-         OR (
-            (outbox.advisory_id LIKE 'FINDINGS:%' OR outbox.advisory_id LIKE 'NEWS:%')
-            AND COALESCE(outbox.error,'') NOT LIKE '%already accepted by the transport%'
-            AND COALESCE(outbox.error,'') NOT LIKE '%could not be confirmed%'
-            AND COALESCE(outbox.error,'') NOT LIKE '%outcome could not be confirmed%'
-         )
+         OR outbox.advisory_id LIKE 'FINDINGS:%'
+         OR outbox.advisory_id LIKE 'NEWS:%'
        )
      RETURNING id`,
     [
@@ -1337,7 +1340,7 @@ export async function queueConsolidatedFindingNotifications(
           [`findings:${ownedDocument.payload.contentRevision}:email:${recipient.id}`],
         );
         if (prior.rows[0] && prior.rows[0].status === 'FAILED')
-          await releaseClaims(tx, claimsForJob(recipient.id, 'finding', ownedIds));
+          await releaseUnattachedClaims(tx, claimsForJob(recipient.id, 'finding', ownedIds));
         return null;
       }
       await attachClaimsToJob(tx, id, claimsForJob(recipient.id, 'finding', ownedIds));
@@ -2069,6 +2072,11 @@ export async function deliverNext(
       // transaction: the claim is only promoted to DELIVERED by the job that
       // actually carries it, so a claim re-taken by a later run after expiry is
       // never overwritten by a stale delivery.
+      //
+      // AUD-007: the delivery outcome moves to UNKNOWN *before* the provider is
+      // contacted. A worker crash after the transport accepted the message then
+      // leaves the job in the safe state — resend stays blocked pending provider
+      // confirmation — instead of looking like a job that was never sent.
       await transaction(pool, async (db) => {
         const log = await get<EmailDeliveryLog>(db, 'emailLogs', job.id);
         if (log)
@@ -2090,6 +2098,11 @@ export async function deliverNext(
               claimsForJob(job.target_id, 'article', carriedArticles.map((article) => newsArticleIdentity(article))),
             );
         }
+        // An ACCEPTED outcome is a fact and is never downgraded.
+        await db.query(
+          `UPDATE outbox SET delivery_outcome='UNKNOWN' WHERE id=$1 AND delivery_outcome<>'ACCEPTED'`,
+          [job.id],
+        );
       });
       // Apply operator edits exactly once, before the transport sees the job.
       // The PDF attachment is built from `payload.html` inside the sender, so
@@ -2222,9 +2235,31 @@ export async function deliverNext(
       await releaseClaims(db, claimsForJob(job.target_id, 'finding', droppedFindingIds), {
         jobId: job.id,
       });
+    // AUD-007: persist the transport's verdict in the same transaction that
+    // commits the outbox status.
+    //   error empty          → the transport confirmed acceptance → ACCEPTED.
+    //   transportRejected    → the transport provably refused the message
+    //                          (HTTP 4xx/5xx body, refused SMTP session, missing
+    //                          configuration) → REJECTED. Retrying cannot
+    //                          duplicate it, so a resend is allowed.
+    //   anything else        → timeout, socket reset, dropped connection, an
+    //                          unknown prior outcome → UNKNOWN. A resend is
+    //                          blocked until provider confirmation resolves it.
+    //   NOT_ATTEMPTED        → only when the failure happened before any send
+    //                          path (transportAttempted is false): the message
+    //                          provably never left. An earlier UNKNOWN is never
+    //                          downgraded — an attempt may already have
+    //                          happened for this job on a prior attempt.
+    const deliveryOutcome: 'NOT_ATTEMPTED' | 'REJECTED' | 'UNKNOWN' | 'ACCEPTED' = !error
+      ? 'ACCEPTED'
+      : transportAttempted && transportRejected
+        ? 'REJECTED'
+        : transportAttempted || !error?.match(/^(Email delivery is disabled|not configured)/)
+          ? 'UNKNOWN'
+          : 'NOT_ATTEMPTED';
     await db.query(
-      `UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now()
-         ${rebuiltPayload ? ',payload=$6::jsonb' : ''} WHERE id=$1`,
+      `UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now(),delivery_outcome=$6
+          ${rebuiltPayload ? ',payload=$7::jsonb' : ''} WHERE id=$1`,
       [
         job.id,
         error ? (failed ? 'FAILED' : 'QUEUED') : 'ACCEPTED',
@@ -2233,6 +2268,10 @@ export async function deliverNext(
         // a delivery is being retried or has failed.
         error || null,
         providerId || null,
+        // The outcome is a fact once recorded: ACCEPTED is never downgraded, and
+        // UNKNOWN is only upgraded by provider evidence (REJECTED) — never to
+        // NOT_ATTEMPTED, because a prior attempt may already have delivered.
+        deliveryOutcome,
         ...(rebuiltPayload ? [JSON.stringify(rebuiltPayload)] : []),
       ],
     );

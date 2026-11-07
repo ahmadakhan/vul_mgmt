@@ -167,19 +167,19 @@ export async function markClaimsDelivered(
  * Releases ONLY the claims owned by the given job.
  *
  * Used when a delivery fails terminally (the recipient provably never received
- * the message) and when a queue pass claimed items but could not enqueue the
- * job. Ownership is enforced (Finding 5): an expired claim that another job has
- * since taken is never deleted by the stale owner. DELIVERED rows are never
- * released: an accepted message is a fact.
+ * the message). Ownership is mandatory (AUD-009): an expired claim that another
+ * job has since taken is never deleted by a stale owner, and the ownership check
+ * cannot be bypassed by omitting the job. DELIVERED rows are never released: an
+ * accepted message is a fact.
  *
- * Administrative recovery of orphaned claims (no owning job, or a job that can
- * no longer be reconstructed) goes through `releaseExpiredClaims`, which never
- * touches a claim whose outbox job is still live.
+ * A claim written during queue creation but whose outbox job was never inserted
+ * (or a rollback that left the claim behind) has no owner — that case has its
+ * own narrowly scoped path in `releaseUnattachedClaims`.
  */
 export async function releaseClaims(
   db: Db,
   requests: readonly ClaimRequest[],
-  options: { jobId?: string } = {},
+  options: { jobId: string },
 ): Promise<number> {
   const unique = [...new Map(requests.map((request) => [claimKey(request), request])).values()];
   if (!unique.length) return 0;
@@ -187,38 +187,68 @@ export async function releaseClaims(
     `DELETE FROM delivery_claims
       WHERE (recipient_id,kind,item_id) IN (SELECT * FROM unnest($1::text[],$2::text[],$3::text[]))
         AND state='CLAIMED'
-        AND ($4::uuid IS NULL OR job_id=$4::uuid)`,
+        AND job_id=$4::uuid`,
     [
       unique.map((request) => request.recipientId),
       unique.map((request) => request.kind),
       unique.map((request) => request.itemId),
-      options.jobId ?? null,
+      options.jobId,
     ],
   );
   return result.rowCount ?? 0;
 }
 
 /**
- * Removes expired CLAIMED rows whose owning job no longer legitimately holds
- * the item. DELIVERED rows are permanent; rows whose job is QUEUED or SENDING
- * (or FAILED with an unconfirmed transport outcome) always hold the item.
+ * Releases claims that were taken during queue creation but whose outbox job
+ * was never inserted (the enqueue deduped, errored, or the transaction rolled
+ * back around the claim).
+ *
+ * AUD-009: deliberately narrow — only rows with `job_id IS NULL` are touched,
+ * so this can never free a claim another (real) job holds. A claim that has
+ * since been attached to a job is managed exclusively through that job's
+ * lifecycle (`releaseClaims`, `markClaimsDelivered`).
+ */
+export async function releaseUnattachedClaims(
+  db: Db,
+  requests: readonly ClaimRequest[],
+): Promise<number> {
+  const unique = [...new Map(requests.map((request) => [claimKey(request), request])).values()];
+  if (!unique.length) return 0;
+  const result = await db.query(
+    `DELETE FROM delivery_claims
+      WHERE (recipient_id,kind,item_id) IN (SELECT * FROM unnest($1::text[],$2::text[],$3::text[]))
+        AND state='CLAIMED'
+        AND job_id IS NULL`,
+    [
+      unique.map((request) => request.recipientId),
+      unique.map((request) => request.kind),
+      unique.map((request) => request.itemId),
+    ],
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
+ * Removes expired CLAIMED rows that no outbox job owns.
+ *
+ * These are claims taken by a queue pass whose transaction rolled back after the
+ * claim was written (or whose enqueue was abandoned mid-transaction): no job
+ * exists to manage them through a delivery lifecycle, so the expiry clock is
+ * their only recovery path.
+ *
+ * AUD-006: a claim WITH an owning job is deliberately left alone here, however
+ * old it is. That job's own lifecycle owns the claim — the finalize path either
+ * promotes it to DELIVERED on acceptance or releases it on a provable
+ * non-delivery — and deleting it from a cleanup sweep could free an item whose
+ * email is still queued, in flight, or failed with an unresolved outcome.
+ * An expired claim whose job row has vanished (retention) is recoverable through
+ * the same sweep the job itself would have followed; explicit administrative
+ * recovery is the path for anything else.
  */
 export async function releaseExpiredClaims(db: Db): Promise<number> {
   const result = await db.query(
     `DELETE FROM delivery_claims
-      WHERE state='CLAIMED' AND expires_at < now()
-        AND (
-          -- No owning job at all (claim written but the enqueue never happened).
-          job_id IS NULL
-          -- The job row is gone (retention swept it).
-          OR NOT EXISTS (SELECT 1 FROM outbox o WHERE o.id = delivery_claims.job_id)
-          -- The job failed terminally; only the finalize path can release its
-          -- claim while it exists, so an unreleased FAILED claim is stale here.
-          OR EXISTS (
-            SELECT 1 FROM outbox o
-             WHERE o.id = delivery_claims.job_id AND o.status = 'FAILED'
-          )
-        )`,
+      WHERE state='CLAIMED' AND expires_at < now() AND job_id IS NULL`,
   );
   return result.rowCount ?? 0;
 }
