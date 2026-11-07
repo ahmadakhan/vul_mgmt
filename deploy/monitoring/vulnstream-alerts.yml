@@ -1,0 +1,323 @@
+groups:
+  - name: vulnstream
+    rules:
+      # --- Availability -------------------------------------------------------
+      #
+      # `up == 0` is only evaluable while the collector is alive. A total outage
+      # (VulnStream + database + collector) produces no series at all, so these
+      # rules are necessary but NOT sufficient; the dead-man's switch is the
+      # only mechanism that covers that case.
+
+      - alert: VulnStreamInstanceUnavailable
+        expr: up{job="vulnstream"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: A VulnStream instance cannot be scraped
+          runbook: Check the pod/container status, then /live and /ready on the instance.
+
+      - alert: VulnStreamAllInstancesDown
+        expr: sum(up{job="vulnstream"}) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: All VulnStream instances are unscrapeable
+
+      # --- Pipeline health ----------------------------------------------------
+      #
+      # `vulnstream_correlation_health` is a one-hot gauge over the three states
+      # HEALTHY / DEGRADED_BACKPRESSURE / RECOVERING_DB_SEVERANCE, always
+      # exported. Select exactly the unhealthy states rather than negating a
+      # series: `{state="HEALTHY"} == 0` also matches a scrape in which the
+      # series is absent, which is a different and much worse failure that the
+      # `up` rules already report.
+
+      - alert: VulnStreamDatabaseRecovery
+        # Restored: this name existed before the rule rewrite and is referenced by
+        # the runbook and by alert history. It is the 1-minute "admission paused"
+        # signal; PipelineNotAdmitting below is the same condition held longer
+        # and escalates, while CircuitBreakerOpen names the specific cause. Three
+        # rules over one condition is deliberate: they answer different questions
+        # (is it happening / is it sustained / is it the breaker).
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on(instance) vulnstream_correlation_health{state="RECOVERING_DB_SEVERANCE"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Advisory admission paused during database recovery
+          runbook: Check database reachability from the instance.
+
+      - alert: VulnStreamPipelineNotAdmitting
+        # Admission stops only for RECOVERING_DB_SEVERANCE (lost database, open
+        # circuit breaker). DEGRADED_BACKPRESSURE halves concurrency but keeps
+        # admitting, so it has its own rule below and must not fire this one.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on(instance) vulnstream_correlation_health{state="RECOVERING_DB_SEVERANCE"} == 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Pipeline is not admitting advisories (database recovery or open circuit breaker)
+          runbook: GET /api/correlation shows health and, if a breaker is open, circuit_reason.
+
+      - alert: VulnStreamCircuitBreakerOpen
+        # Same condition as above but a longer `for`: by five minutes the
+        # breaker's own PAUSE_DURATION is the thing keeping it shut, so recovery
+        # is not imminent and an operator must intervene.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on(instance) vulnstream_correlation_health{state="RECOVERING_DB_SEVERANCE"} == 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Circuit breaker open for 5 minutes; no advisory is being admitted
+          runbook: Check database reachability from the instance; the breaker clears itself after recovery.
+
+      - alert: VulnStreamMemoryPressure
+        expr: vulnstream_correlation_memory_percent >= 85
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: VulnStream is shedding ingestion under memory pressure
+          runbook: Halving concurrency is automatic; a sustained condition means the heap limit is too small.
+
+      - alert: VulnStreamAdmissionExhausted
+        # concurrencyLimit is clamped to >= 1 by the supervisor, so this fires
+        # only on a genuine defect or a policy row the running build cannot
+        # honour. Kept as a cheap invariant check rather than a capacity signal.
+        expr: vulnstream_correlation_worker_enabled == 1 and vulnstream_correlation_concurrency_limit < 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Pipeline concurrency limit is below one worker
+
+      # --- Progress -----------------------------------------------------------
+      #
+      # Each stall rule needs THREE things to be true, and getting one wrong was
+      # the reason the previous versions could not work:
+      #   1. the worker is supposed to be running (WORKER_ENABLED), or a
+      #      monitoring-only deployment alarms forever;
+      #   2. the supervisor is not deliberately holding admission (in which case
+      #      the health rule above is the real alert, and this one is noise);
+      #   3. nothing has completed for the whole window.
+      #
+      # `on()` with no labels joins every series in the expression, which
+      # silently multiplies the result by the number of scraped instances and
+      # discards labels every alert needs. The aggregations below must be
+      # scalar-vs-scalar or vector-vs-scalar.
+
+      - alert: VulnStreamIngestionStalled
+        # Work is queued and the worker is admitted, yet nothing completes.
+        # Qualifying on the queue depth matters: a healthy idle pipeline with an
+        # empty queue has a flat counter by design and must stay quiet.
+        # `pending_sample_age_seconds < 120` rejects a stale cached depth -- the
+        # sample is taken by the drain loop, so a wedged drain loop would leave
+        # an old depth here while progress rules read it as current.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on()
+          vulnstream_correlation_health{state="RECOVERING_DB_SEVERANCE"} == 0
+          and on()
+          vulnstream_correlation_pending > 0
+          and on()
+          vulnstream_correlation_pending_sample_age_seconds >= 0
+          and on()
+          vulnstream_correlation_pending_sample_age_seconds < 120
+          and on()
+          increase(vulnstream_correlation_items_total[10m]) == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: Work is queued and admitted, but no advisory has completed in 10 minutes
+          runbook: Check the drain loop and the worker deadline log (supervisor.worker_deadline).
+
+      - alert: VulnStreamWorkersStuck
+        # Slots are occupied but nothing finishes: the 15s worker deadline is
+        # aborting and retrying, or a worker is wedged outside the check.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on()
+          vulnstream_correlation_health{state="RECOVERING_DB_SEVERANCE"} == 0
+          and on()
+          min_over_time(vulnstream_correlation_workers[5m]) > 0
+          and on()
+          increase(vulnstream_correlation_items_total[10m]) == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: Workers are occupied but no item has completed in 10 minutes
+
+  # --- Pipeline scheduler ------------------------------------------------
+  #
+  # The feed-ingestion scheduler (shouldStartAutomaticRun in server/pipeline.ts)
+  # starts a pipeline run every `schedulerIntervalMinutes` when both
+  # WORKER_ENABLED and the in-app scheduler setting are enabled. A stall here
+  # means fresh threat intelligence stops arriving — different from the
+  # ingestion/stalled rules above, which fire when work is queued but nothing
+  # completes.
+  #
+  # `vulnstream_pipeline_last_run_age_seconds` is 0 when the scheduler has
+  # never produced a run and -1 when the sample itself is stale (DB unavailable).
+  # A run at age 0 is not an alert condition — it means the scheduler is new or
+  # has never completed; the `for:` window lets an operator notice that without
+  # paging at midnight on a fresh install.
+
+      - alert: VulnStreamPipelineSchedulerDisabled
+        # Worker process is up but the in-app scheduler toggle is off, so no
+        # automatic runs will ever start. Recovery probes still fire for DOWN
+        # feeds, but routine ingestion is paused.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on(instance)
+          vulnstream_pipeline_scheduler_enabled == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Pipeline scheduler is disabled in application settings
+          runbook: Enable Scheduler in Settings → Pipeline, or set WORKER_ENABLED=false if this is a monitoring-only node.
+
+      - alert: VulnStreamPipelineSchedulerStalled
+        # Scheduler is enabled, worker is enabled, yet no run has started in
+        # far longer than the configured interval. Covers the case where the
+        # advisory lock is wedged, the tick loop is stuck, or last_run is stale.
+        expr: |
+          vulnstream_correlation_worker_enabled == 1
+          and on(instance)
+          vulnstream_pipeline_scheduler_enabled == 1
+          and on(instance)
+          vulnstream_pipeline_last_run_age_seconds > 7200
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: Pipeline scheduler enabled but no run has started in over 2 hours
+          runbook: Check pipeline execution history in the UI; the advisory lock (pg_try_advisory_lock) may be stuck. Verify the worker process is not blocked on a long-running query.
+
+      # --- Dead-man's switch telemetry ---------------------------------------
+  #
+  # `vulnstream_heartbeat_age_seconds` is -1 until the first successful ping,
+      # so it must be gated on the heartbeat actually having pinged. `-1 > 180`
+      # is false: without this guard a heartbeat that never started would be
+      # silently exempt from its own staleness check.
+
+      - alert: VulnStreamHeartbeatNeverStarted
+        # Enabled, running past one full interval, and still no successful ping.
+        expr: |
+          vulnstream_heartbeat_enabled == 1
+          and on()
+          vulnstream_heartbeat_state{state="pinged"} == 0
+          and on()
+          vulnstream_heartbeat_state{state="suppressed"} == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: Dead-man's switch is enabled but has never successfully pinged
+
+      - alert: VulnStreamHeartbeatStale
+        expr: |
+          vulnstream_heartbeat_state{state="pinged"} == 1
+          and on()
+          vulnstream_heartbeat_age_seconds > 180
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Dead-man's switch has not received a ping for over 3 minutes
+          runbook: The external receiver will alarm shortly. Check HEARTBEAT_URL and egress.
+
+      - alert: VulnStreamHeartbeatFailing
+        # `consecutive_failures` is a GAUGE that resets to 0 on success. The
+        # previous rule applied increase() to it while it was exported as
+        # `_total`; because the value drops back to zero on every recovery,
+        # Prometheus interprets each reset as a counter restart and the alert
+        # fired on ordinary healing rather than on sustained failure.
+        expr: vulnstream_heartbeat_consecutive_failures >= 3
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Heartbeat pings are failing; the external receiver may alarm soon
+
+      # --- Data integrity -----------------------------------------------------
+
+      - alert: VulnStreamDeadLetterSpoolSaturating
+        # The durable spool accepts at most 256 letters (deadLetter.ts). Beyond
+        # that, capture() reports capacity and every new failure depends on the
+        # database fallback — and if that is also unavailable, the record enters
+        # the last-resort loss window. 200 leaves headroom to act.
+        expr: vulnstream_correlation_dead_letter_spool_files >= 200
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Dead-letter spool is near its 256-file capacity
+          runbook: Check disk space on the spool volume and the database fallback; replay or dismiss letters to free files.
+
+      - alert: VulnStreamDeadLetterSpoolFull
+        expr: vulnstream_correlation_dead_letter_spool_files >= 256
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Dead-letter spool is full; new failures depend on the database
+          runbook: Free spool files immediately. Records that fail while the spool is full AND the database is unreachable are not durable.
+
+      - alert: VulnStreamDeadLetters
+        expr: increase(vulnstream_correlation_dead_letters_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Advisory input needs dead-letter review
+
+      - alert: VulnStreamDeadLetterBurst
+        expr: increase(vulnstream_correlation_dead_letters_total[10m]) > 50
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Dead-letter rate exceeds 5/min; check the migration and schema contract
+          runbook: A burst right after a deploy usually means a schema-contract failure; see correlation_dead_letters.error_code.
+
+      - alert: VulnStreamLogLoss
+        expr: increase(vulnstream_correlation_dropped_logs_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: Stdout collector congestion exceeded the bounded log queue
+          runbook: The dropped entries may include CRITICAL events. Check the collector's backpressure.
+
+      # --- ML model drift and retraining ---------------------------------------
+      #
+      # Metrics emitted by the ML training orchestrator (server/ml/train/orchestrator.ts)
+      # and the quality gate subsystem (server/ml/train/qualityGates.ts).
+      #
+      # `vulnstream_ml_model_drift_detected` is a one-hot gauge (1 = drift
+      # detected, 0 = no drift) per modelId. Concept drift (AUC/precision/
+      # recall degradation) or feature drift (PSI) triggers retraining.
+      #
+      # `vulnstream_ml_quality_gate_failed_total` counts consecutive quality
+      # gate failures per modelId. A model that fails its gate leaves the
+      # active artifact untouched (implicit rollback), but repeated failures
+      # mean the model is stuck on stale data.
+
+      - alert: VulnStreamMLModelDriftDetected
+        expr: |
+          vulnstream_ml_model_drift_detected == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: ML model drift detected; retraining recommended
+          runbook: Run the ML training cron (server/ml/train/cron.ts) and review the drift report in the model manifest.
+
+      - alert: VulnStreamMLQualityGateFailed
+        expr: |
+          increase(vulnstream_ml_quality_gate_failed_total[10m]) > 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: ML model quality gate failed; active artifact retained
+          runbook: Inspect training data quality and model metrics; the old artifact remains active until a new one passes the gate.
+
+      - alert: VulnStreamMLModelStale
+        expr: |
+          vulnstream_ml_model_last_trained_age_seconds > 864000
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: ML model has not been retrained for over 10 days
+          runbook: Verify the training cron is running and that labeled outcomes are flowing into the orchestrator.

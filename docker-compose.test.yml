@@ -1,0 +1,57 @@
+services:
+  test-db:
+    image: postgres:17-alpine
+    container_name: vulnstream-test-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vulnstream_test
+    command: >
+      postgres
+      -c shared_buffers=128MB
+      -c work_mem=8MB
+      -c maintenance_work_mem=64MB
+      -c max_connections=100
+      -c fsync=off
+      -c synchronous_commit=off
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+    tmpfs:
+      - /var/lib/postgresql/data
+      - /tmp
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U postgres -d vulnstream_test -h localhost -p 5432
+      interval: 1s
+      timeout: 5s
+      retries: 30
+      start_period: 2s
+    restart: "no"
+    networks: [test-network]
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: vulnstream-test-runner
+    depends_on:
+      test-db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: test
+      TEST_DATABASE_URL: postgres://postgres:postgres@test-db:5432/vulnstream_test
+      ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      EGRESS_ALLOWED_HOSTS: 8.8.8.8,filestore.fortinet.com
+      WORKER_ENABLED: 'false'
+      VITEST_TEST_TIMEOUT: '10000'
+      VITEST_POOL: 'forks'
+      VITEST_ISOLATE: 'true'
+    command: [npm, run, test:vitest]
+    restart: "no"
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge

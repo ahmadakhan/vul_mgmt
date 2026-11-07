@@ -1,0 +1,42 @@
+import { applyCommand } from '../../server/commands.ts';
+import { transaction } from '../../server/db.ts';
+/** Disposable browser fixture: all writes live in a new temporary schema. */
+import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import pg from 'pg';
+import { createPool, migrate } from '../../server/db.ts';
+import { createUser } from '../../server/auth.ts';
+import { createApp } from '../../server/app.ts';
+import { loadConfig } from '../../server/config.ts';
+import { CorrelationRuntime } from '../../server/correlation/runtime.ts';
+if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL required');
+const master = createPool(process.env.TEST_DATABASE_URL);
+const schema = 'correlation_preview_' + randomBytes(12).toString('hex');
+await master.query(`CREATE SCHEMA ${schema}`);
+const pool = new pg.Pool({connectionString:process.env.TEST_DATABASE_URL,options:`-c search_path=${schema}`,connectionTimeoutMillis:2000});
+const directory = await mkdtemp(join(tmpdir(),'correlation-preview-'));
+await migrate(pool);
+const config = loadConfig({NODE_ENV:'test',DATABASE_URL:process.env.TEST_DATABASE_URL,APP_ORIGIN:'http://127.0.0.1:8097',ENCRYPTION_KEY:randomBytes(32).toString('base64'),WORKER_ENABLED:'false'});
+await createUser(pool,'preview','Disposable-preview-password-2026!','ADMIN');
+await pool.query("INSERT INTO assets(id,vendor,product,version,purl) VALUES($1,'kubernetes','kubernetes','1.28.0','pkg:generic/kubernetes@1.28.0')",[randomUUID()]);
+await transaction(pool,db=>applyCommand(db,config,{action:'asset.save',actor:'preview',data:{vendor:'example',product:'widget',cpes:['cpe:2.3:a:example:widget:1.0:*:*:*:*:*:*:*'],assetTag:'Preview widget',ownerGroup:'Preview',active:true}}));
+const runtime = new CorrelationRuntime(pool,[config.ENCRYPTION_KEY],directory);
+runtime.start();
+await runtime.supervisor.ingestor.processIncomingAdvisory({title:'Kubernetes vulnerability actively exploited',content:'Researchers report an unpatched vulnerability in k8s.',url:'https://example.org/preview/1'},pool);
+await runtime.supervisor.ingestor.processIncomingAdvisory({title:'Unpatched unknown software vulnerability',content:'Unknown software actively exploited in the wild; an unpatched zero-day.',url:'https://example.org/preview/review'},pool);
+await runtime.supervisor.ingestor.processIncomingAdvisory({malformed:true},pool);
+await runtime.supervisor.ingestor.deadLetterQueue.flush(pool);
+const server = createApp(pool,config,async()=>({status:200,body:'[]',headers:{}}),{correlation:runtime}).listen(8097,'127.0.0.1');
+console.log('Disposable correlation preview listening on http://127.0.0.1:8097');
+let stopped = false;
+async function stop() {
+  if (stopped) return; stopped = true;
+  await new Promise<void>(resolve=>server.close(()=>resolve()));
+  await runtime.stop(); await pool.end();
+  await master.query(`DROP SCHEMA ${schema} CASCADE`); await master.end();
+  await rm(directory,{recursive:true,force:true});
+}
+process.on('SIGTERM',()=>void stop());
+process.on('SIGINT',()=>void stop());

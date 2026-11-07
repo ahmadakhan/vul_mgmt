@@ -1,0 +1,1 @@
+{"name":"BA Threat Intel Enterprise — Vulnerability Intelligence \u0026 Pipeline","description":"Multi-source CVE threat feed ingestion, CPE-first watch-list matching, autonomous risk classification, remediation generation, and zero-human notification orchestration.","requestFramePermissions":[],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}

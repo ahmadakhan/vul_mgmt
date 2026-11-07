@@ -1,0 +1,12 @@
+{
+  "schemaBefore": 4,
+  "schemaAfter": 14,
+  "inventoryRecords": 2,
+  "inventoryUnchanged": true,
+  "projectionRecords": 2,
+  "notificationsEnabled": false,
+  "composeSchemaVersion": 14,
+  "composeApplicationReplicas": 2,
+  "composeMonitoring": "Prometheus, authenticated per-instance scrapes",
+  "rollbackBackup": "Encrypted pre-migration backup and previous image retained outside source control"
+}

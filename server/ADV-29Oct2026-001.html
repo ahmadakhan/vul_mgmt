@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ADV-{{advisory_id}}</title>
+<style type="text/css">
+  body,table,td,a { -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  table,td { mso-table-lspace:0pt; mso-table-rspace:0pt; }
+  table { border-collapse:collapse; }
+  a { overflow-wrap:anywhere; word-break:break-word; }
+  .ms-rteTableEvenCol-default { font-weight:700;color:#0f172a; }
+  .ms-rteTableOddCol-default { color:#334155; }
+  .sev-critical { background:#ef4444;color:#ffffff; }
+  .sev-high { background:#f59e0b;color:#ffffff; }
+  .sev-medium { background:#eab308;color:#1e293b; }
+  .sev-low { background:#10b981;color:#ffffff; }
+  .sev-badge { display:inline-block;padding:2px 10px;border-radius:4px;font-size:11px;line-height:16px;font-weight:700;letter-spacing:0.5px; }
+  @media only screen and (max-width:600px) {
+    .outer { padding:16px 8px !important; }
+    .ms-rteTableEvenCol-default { width:30% !important; }
+    .section { padding:20px 16px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;color:#334155;font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<p>&nbsp;<br/></p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;background:#f1f5f9;">
+  <tr>
+    <td class="outer" align="center" style="padding:36px 16px;">
+      <!--[if mso]><table role="presentation" width="680" align="center"><tr><td><![endif]-->
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #cbd5e1;border-radius:12px;">
+        <tr>
+          <td class="section" style="padding:24px 32px;background:#0f172a;border-top:4px solid #2563eb;">
+            <p style="margin:0 0 12px;color:#cbd5e1;font-size:10px;line-height:14px;font-weight:700;letter-spacing:2px;">BA Cyber | THREAT INTELLIGENCE</p>
+            <p style="margin:0 0 6px;">
+              <span class="sev-badge" style="background:#2563eb;color:#ffffff;font-size:11px;line-height:14px;letter-spacing:1px;font-weight:700;">{{severity}}</span>
+            </p>
+            <h1 style="margin:0 0 8px;font-size:24px;line-height:30px;font-weight:700;letter-spacing:-.25px;color:#ffffff;">{{advisory_title}}</h1>
+            <p style="margin:0;font-size:11px;line-height:18px;color:#cbd5e1;">{{advisory_id}}<br/>Date: {{dispatch_date}}</p>
+          </td>
+        </tr>
+        <tr>
+          <td class="section" style="padding:24px 32px;font-size:14px;line-height:24px;color:#334155;">
+            <p style="margin:0 0 12px;font-size:11px;line-height:18px;font-weight:700;letter-spacing:1.5px;color:#2563eb;">SECURITY ADVISORY</p>
+
+            <table class="ms-rteTable-default" cellspacing="0" style="width:100%;">
+              <tbody>
+
+               <tr class="ms-rteTableOddRow-default">
+                 <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">CVE ID</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  {{cve_id_links}}
+                </td>
+              </tr>
+
+              <tr class="ms-rteTableEvenRow-default" style="background:#f8fafc;">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">Severity</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  <font class="ms-rteForeColor-2"><strong>{{severity}}</strong></font>
+                </td>
+              </tr>
+
+              <tr class="ms-rteTableOddRow-default">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">Date of Release</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">{{dispatch_date}}</td>
+              </tr>
+
+              <tr class="ms-rteTableEvenRow-default" style="background:#f8fafc;">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">Date of Update</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">{{dispatch_date}}</td>
+              </tr>
+
+              <tr class="ms-rteTableOddRow-default">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">
+                  <a name="zero_day" id="zero_day"><span style="color:#ffffff;">Vulnerability Details</span></a>
+                </td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  {{cve_details}}
+                </td>
+              </tr>
+
+              <tr class="ms-rteTableEvenRow-default" style="background:#f8fafc;">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">Affected Products and Versions</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  <ul style="margin:0 0 8px;padding-left:18px;font-size:12px;line-height:20px;">
+                    {{affected_systems_html}}
+                  </ul>
+                 </td>
+               </tr>
+
+               <tr class="ms-rteTableOddRow-default">
+                 <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">
+                   <a name="fix_section" id="fix_section"><span style="color:#ffffff;">Fix</span></a>
+                 </td>
+                 <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                   <ol style="margin:0 0 8px;padding-left:24px;font-size:12px;line-height:20px;">
+                     <li style="margin-bottom:8px;"><strong>Remediation:</strong>
+                       <div style="margin-top:8px;border-left:3px solid #2563eb;padding:8px 12px;background:#f8fafc;white-space:pre-wrap;overflow-wrap:anywhere;font-family:monospace;font-size:11px;">{{remediation_steps}}</div>
+                     </li>
+                   </ol>
+                   {{#if remediation_link}}<p style="margin:8px 0 0;"><a href="{{remediation_link}}" target="_blank" style="color:#2563eb;text-decoration:underline;">View Vendor Guidance</a></p>{{/if}}
+                 </td>
+               </tr>
+
+              <tr class="ms-rteTableEvenRow-default" style="background:#f8fafc;">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">
+                  <a name="mitigation" id="mitigation"><span style="color:#ffffff;">Workaround / Temporary fix / Mitigation</span></a>
+                </td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  {{mitigation_steps}}
+                </td>
+              </tr>
+
+              <tr class="ms-rteTableOddRow-default">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">References</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  <ul style="margin:0;padding-left:18px;font-size:12px;line-height:20px;">
+                    {{#if references_link}}<li style="margin-bottom:4px;"><a href="{{references_link}}" target="_blank" style="color:#2563eb;text-decoration:underline;">Advisory link</a></li>{{/if}}
+                  </ul>
+                </td>
+              </tr>
+
+              <tr class="ms-rteTableEvenRow-default" style="background:#f8fafc;">
+                <td class="ms-rteTableEvenCol-default" style="width:11%;padding:10px 12px;border:1px solid #e2e8f0;">Recommended Action</td>
+                <td class="ms-rteTableOddCol-default" style="padding:10px 12px;border:1px solid #e2e8f0;">
+                  {{recommended_actions}}
+                </td>
+              </tr>
+
+              </tbody>
+            </table>
+
+          </td>
+        </tr>
+        <tr>
+          <td class="section" style="padding:20px 32px;border-top:1px solid #cbd5e1;font-size:11px;line-height:18px;color:#334155;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="50%" valign="top">
+                  <p style="margin:0 0 4px;font-weight:700;">BA Threat Intel · Security Operations</p>
+                  <p style="margin:0;">Generated from monitored inventory and threat intelligence. Validate applicability and follow your approved change process before remediation.</p>
+                </td>
+                <td width="50%" align="right" valign="top">
+                  <p style="margin:0;font-size:10px;line-height:14px;letter-spacing:0.5px;">Reference: ADV-{{advisory_id}}</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+      <!--[if mso]></td></tr></table><![endif]-->
+    </td>
+  </tr>
+</table>
+<p>&nbsp;<br/></p>
+</body>
+</html>

@@ -1,0 +1,30 @@
+.system-health {
+  min-width: 0;
+}
+
+.system-health :is(button, a, input, select):focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 3px;
+}
+
+.system-health article,
+.system-health section {
+  min-width: 0;
+}
+
+.system-health time {
+  font-variant-numeric: tabular-nums;
+}
+
+.system-health [role='alert'] {
+  line-height: 1.65;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .system-health * {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

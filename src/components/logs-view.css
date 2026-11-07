@@ -1,0 +1,809 @@
+.ml-logs,
+.system-logs
+{
+  display: grid;
+  gap: 22px;
+  min-width: 0;
+}
+.ml-logs-header,
+.system-logs-header,
+.ml-logs-heading,
+.system-logs-heading
+{
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.ml-logs-header,
+.system-logs-header
+{
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.ml-logs-heading,
+.system-logs-heading
+{
+  min-width: 0;
+}
+.ml-logs-icon,
+.system-logs-icon
+{
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  color: var(--ui-accent);
+  background: var(--ui-focus);
+  border: 1px solid color-mix(in srgb, var(--ui-accent) 20%, transparent);
+  border-radius: 12px;
+}
+.ml-logs-heading h2,
+.system-logs-heading h2
+{
+  color: var(--ui-text);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+.ml-logs-heading p,
+.system-logs-heading p
+{
+  color: var(--ui-muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-top: 4px;
+}
+.ml-logs-live,
+.system-logs-live
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-live > span,
+.system-logs-live > span
+{
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34d399;
+}
+.light .ml-logs-live > span,
+.light .system-logs-live > span
+{
+  background: #059669;
+}
+.ml-logs-live.is-paused > span,
+.system-logs-live.is-paused > span
+{
+  background: var(--ui-muted);
+}
+.ui-main .ml-logs .ml-logs-filters,
+.ui-main .system-logs .system-logs-filters
+{
+  padding: 20px 22px;
+}
+.ml-logs-filter-title,
+.system-logs-filter-title
+{
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 16px;
+  color: var(--ui-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.ml-logs-filter-grid,
+.system-logs-filter-grid
+{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px auto;
+  gap: 16px;
+  align-items: end;
+}
+.ml-logs-filter-grid label,
+.system-logs-filter-grid label
+{
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ui-muted);
+  font-size: 12px;
+}
+.ml-logs .ml-logs-filter-grid :is(input, select),
+.system-logs .system-logs-filter-grid :is(input, select) {
+  width: 100%;
+  min-width: 0;
+  height: 44px;
+  min-height: 44px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background-color: var(--ui-control);
+  color: var(--ui-text);
+  font-size: 13px;
+}
+.ml-logs-filter-grid select,
+.system-logs-filter-grid select
+{
+  padding: 0 36px 0 12px;
+}
+.ml-logs-search-control,
+.system-logs-search-control
+{
+  position: relative;
+}
+.ml-logs .ml-logs-search-control input,
+.system-logs .system-logs-search-control input
+{
+  padding: 0 40px 0 39px;
+}
+.ml-logs-search-control input::-webkit-search-cancel-button,
+.system-logs-search-control input::-webkit-search-cancel-button
+{
+  -webkit-appearance: none;
+}
+.ml-logs-search-control > svg,
+.system-logs-search-control > svg
+{
+  position: absolute;
+  left: 13px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--ui-muted);
+}
+.ml-logs-search-control > button,
+.system-logs-search-control > button
+{
+  position: absolute;
+  right: 7px;
+  top: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: var(--ui-muted);
+}
+.ml-logs-search-control > button:hover,
+.system-logs-search-control > button:hover
+{
+  color: var(--ui-text);
+  background: var(--ui-control-hover);
+}
+.ml-logs-button,
+.system-logs-button
+{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--ui-border);
+  border-radius: 8px;
+  background: var(--ui-control);
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.ml-logs-button:hover:not(:disabled),
+.system-logs-button:hover:not(:disabled)
+{
+  background: var(--ui-control-hover);
+}
+.ml-logs-button:disabled,
+.system-logs-button:disabled
+{
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ml-logs-refresh,
+.system-logs-refresh
+{
+  min-height: 44px;
+  padding-inline: 17px;
+}
+.ml-logs :is(button, input, select):focus-visible,
+.system-logs :is(button, input, select):focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 3px;
+}
+.ml-logs-filter-summary,
+.system-logs-filter-summary
+{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 13px;
+  border-top: 1px solid var(--ui-divider);
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-filter-summary button,
+.system-logs-filter-summary button
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  color: var(--ui-accent);
+}
+.ml-logs-error,
+.system-logs-error
+{
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 17px 20px;
+  border: 1px solid #fb71854d;
+  background: #fb71850b;
+  border-radius: 12px;
+  color: var(--ui-text);
+  font-size: 12px;
+}
+.ml-logs-error > svg,
+.system-logs-error > svg
+{
+  flex-shrink: 0;
+  color: #fb7185;
+}
+.light .ml-logs-error > svg,
+.light .system-logs-error > svg
+{
+  color: #be123c;
+}
+.ml-logs-error > div,
+.system-logs-error > div
+{
+  flex: 1;
+  min-width: 0;
+}
+.ml-logs-error p,
+.system-logs-error p
+{
+  margin-top: 5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  color: var(--ui-muted);
+}
+.ui-main .ml-logs .ml-logs-events,
+.ui-main .system-logs .system-logs-events
+{
+  overflow: hidden;
+  padding: 0;
+}
+.ml-logs-events-heading,
+.system-logs-events-heading
+{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 21px 22px;
+  border-bottom: 1px solid var(--ui-divider);
+}
+.ml-logs-events-heading h3,
+.system-logs-events-heading h3
+{
+  color: var(--ui-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.ml-logs-events-heading p,
+.system-logs-events-heading p
+{
+  margin-top: 5px;
+  color: var(--ui-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.ml-logs-page-count,
+.system-logs-page-count
+{
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-count-error,
+.system-logs-count-error,
+.ml-logs-count-warning,
+.system-logs-count-warning
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.ml-logs-count-error::before,
+.system-logs-count-error::before,
+.ml-logs-count-warning::before,
+.system-logs-count-warning::before
+{
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ml-logs-count-error,
+.system-logs-count-error
+{
+  color: #fda4af;
+}
+.ml-logs-count-warning,
+.system-logs-count-warning
+{
+  color: #fcd34d;
+}
+.light .ml-logs-count-error,
+.light .system-logs-count-error
+{
+  color: #be123c;
+}
+.light .ml-logs-count-warning,
+.light .system-logs-count-warning
+{
+  color: #92400e;
+}
+.ml-logs .ml-logs-table,
+.system-logs .system-logs-table
+{
+  /* Layout only. Border model, cell padding, dividers and the row hover belong
+     to the canonical .ui-main table rules in src/index.css; a `border-collapse:
+     collapse` here silently replaced them (last-row divider removal and the
+     td[colspan] padding both rely on the separate model). */
+  width: 100%;
+  table-layout: fixed;
+  text-align: left;
+}
+.ml-logs .ml-logs-table th:nth-child(1),
+.system-logs .system-logs-table th:nth-child(1)
+{
+  width: 80px;
+}
+.ml-logs .ml-logs-table th:nth-child(2),
+.system-logs .system-logs-table th:nth-child(2)
+{
+  width: auto;
+}
+.ml-logs .ml-logs-table th:nth-child(3)
+{
+  width: 190px;
+}
+.system-logs .system-logs-table th:nth-child(3)
+{
+  width: 220px;
+}
+.ml-logs .ml-logs-table th:nth-child(4),
+.system-logs .system-logs-table th:nth-child(4)
+{
+  width: 138px;
+}
+.ml-logs-code,
+.system-logs-code
+{
+  display: block;
+  margin-bottom: 7px;
+  color: var(--ui-muted);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.ml-logs .ml-logs-table .ml-logs-event-title,
+.system-logs .system-logs-table .system-logs-event-title
+{
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: 100%;
+  text-align: left;
+  color: var(--ui-text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.ml-logs .ml-logs-table .ml-logs-event-title > svg,
+.system-logs .system-logs-table .system-logs-event-title > svg
+{
+  align-self: center;
+  flex-shrink: 0;
+  color: var(--ui-muted);
+}
+.ml-logs .ml-logs-table .ml-logs-event-title:hover > svg,
+.system-logs .system-logs-table .system-logs-event-title:hover > svg
+{
+  color: var(--ui-accent);
+}
+.ml-logs-context,
+.system-logs-context
+{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 15px;
+  margin-top: 8px;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-context > div,
+.system-logs-context > div
+{
+  display: inline-flex;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.7;
+}
+.ml-logs-context dt,
+.system-logs-context dt
+{
+  flex-shrink: 0;
+}
+.ml-logs-context dd,
+.system-logs-context dd
+{
+  color: var(--ui-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.ml-logs-run,
+.system-logs-run
+{
+  display: block;
+  margin-top: 7px;
+  color: var(--ui-muted);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.ml-logs-unlinked,
+.system-logs-unlinked
+{
+  display: block;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-correlation-cell
+{
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.system-logs-context-cell
+{
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.system-logs-origin,
+.system-logs-correlation
+{
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--ui-text);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.system-logs-origin > span,
+.system-logs-correlation > span
+{
+  flex-shrink: 0;
+  color: var(--ui-muted);
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.system-logs-origin
+{
+  color: var(--ui-accent);
+}
+.ml-logs-error-preview,
+.system-logs-error-preview
+{
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  margin-top: 8px;
+  color: #fda4af;
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.light .ml-logs-error-preview,
+.light .system-logs-error-preview
+{
+  color: #be123c;
+}
+.ml-logs-level,
+.system-logs-level
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  padding: 4px 7px;
+  background: var(--ui-focus);
+  color: var(--ui-accent);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ml-logs-level > span,
+.system-logs-level > span
+{
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ml-logs-level.is-warning,
+.system-logs-level.is-warning
+{
+  color: #fcd34d;
+  background: #fbbf2414;
+}
+.ml-logs-level.is-error,
+.system-logs-level.is-error
+{
+  color: #fda4af;
+  background: #fb718514;
+}
+.light .ml-logs-level.is-warning,
+.light .system-logs-level.is-warning
+{
+  color: #92400e;
+  background: #fbbf241a;
+}
+.light .ml-logs-level.is-error,
+.light .system-logs-level.is-error
+{
+  color: #be123c;
+  background: #fb71851a;
+}
+.ml-logs-time-cell time,
+.system-logs-time-cell time
+{
+  display: grid;
+  gap: 5px;
+  color: var(--ui-muted);
+  font-size: 11px;
+  line-height: 1.7;
+  font-variant-numeric: tabular-nums;
+}
+.ml-logs .ml-logs-table .ml-logs-detail,
+.system-logs .system-logs-table .system-logs-detail
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 0 4px;
+  color: var(--ui-accent);
+  font-size: 11px;
+}
+.ml-logs-footer,
+.system-logs-footer
+{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 16px 22px;
+  border-top: 1px solid var(--ui-divider);
+  background: var(--ui-subtle);
+}
+.ml-logs-update,
+.system-logs-update
+{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.ml-logs-footer nav,
+.system-logs-footer nav
+{
+  display: flex;
+  gap: 7px;
+}
+.ml-logs-empty,
+.system-logs-empty
+{
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 50px 24px;
+  color: var(--ui-muted);
+  text-align: center;
+}
+.ml-logs-empty > svg,
+.system-logs-empty > svg
+{
+  color: var(--ui-accent);
+}
+.ml-logs-empty h3,
+.system-logs-empty h3
+{
+  color: var(--ui-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.ml-logs-empty p,
+.system-logs-empty p
+{
+  max-width: 420px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+@media (max-width: 1100px){
+  .ml-logs .ml-logs-table th:nth-child(3) {
+    width: 170px;
+  }
+  .system-logs .system-logs-table th:nth-child(3) {
+    width: 195px;
+  }
+  .ml-logs .ml-logs-table :is(th, td),
+  .system-logs .system-logs-table :is(th, td) {
+    padding-inline: 16px;
+  }
+}
+@media (max-width: 767px){
+  .ml-logs {
+    gap: 18px;
+  }
+  .ml-logs-heading {
+    align-items: flex-start;
+  }
+  .ml-logs-heading h2 {
+    font-size: 15px;
+  }
+  .ml-logs-heading p {
+    font-size: 11px;
+  }
+  .ml-logs-icon {
+    width: 38px;
+    height: 38px;
+  }
+  .ml-logs-filter-grid {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 14px 12px;
+  }
+  .ml-logs-search,
+  .system-logs-search {
+    grid-column: 1 / -1;
+  }
+  .ui-main .ml-logs .ml-logs-filters {
+    padding: 18px;
+  }
+  .ml-logs-events-heading {
+    align-items: flex-start;
+    padding: 18px;
+    gap: 12px;
+  }
+  .ml-logs .ml-logs-table,
+  .system-logs .system-logs-table {
+    display: block;
+  }
+  .ml-logs .ml-logs-table thead,
+  .system-logs .system-logs-table thead {
+    display: none;
+  }
+  .ml-logs .ml-logs-table tbody,
+  .system-logs .system-logs-table tbody {
+    display: block;
+  }
+  .ml-logs .ml-logs-table tr,
+  .system-logs .system-logs-table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 18px;
+    gap: 12px 8px;
+    border-bottom: 1px solid var(--ui-divider);
+  }
+  .ml-logs .ml-logs-table tr:last-child,
+  .system-logs .system-logs-table tr:last-child {
+    border-bottom: 0;
+  }
+  .ml-logs .ml-logs-table td,
+  .system-logs .system-logs-table td {
+    border: 0;
+    padding: 0;
+  }
+  .ml-logs-event-cell,
+  .system-logs-event-cell {
+    grid-column: 1 / -1;
+  }
+  .ml-logs-level-cell,
+  .system-logs-level-cell {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .ml-logs-time-cell,
+  .system-logs-time-cell {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  .ml-logs-time-cell time {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 9px;
+  }
+  .ml-logs-correlation-cell,
+  .system-logs-context-cell {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    padding-top: 8px !important;
+    border-top: 1px solid var(--ui-divider) !important;
+  }
+  .system-logs-context > div {
+    width: 100%;
+  }
+  .system-logs-context dd {
+    max-width: 100%;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: normal;
+  }
+  .system-logs-origin,
+  .system-logs-correlation {
+    margin-bottom: 8px;
+  }
+  .system-logs .system-logs-table th,
+  .ml-logs .ml-logs-table th {
+    width: auto;
+  }
+  .ml-logs-footer,
+  .system-logs-footer {
+    padding: 16px 18px;
+  }
+  .ml-logs-footer nav,
+  .system-logs-footer nav {
+    width: 100%;
+  }
+  .ml-logs-footer nav button,
+  .system-logs-footer nav button {
+    flex: 1;
+    padding-inline: 8px;
+  }
+  .ml-logs-error,
+  .system-logs-error {
+    flex-wrap: wrap;
+    padding: 16px;
+  }
+  .ml-logs-error > .ml-logs-button,
+  .system-logs-error > .system-logs-button {
+    margin-left: 31px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ml-logs .animate-spin,
+  .system-logs .animate-spin {
+    animation: none;
+  }
+}

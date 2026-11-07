@@ -1,0 +1,13 @@
+{
+	default_sni {$LAN_BIND_ADDRESS}
+}
+
+http://{$LAN_BIND_ADDRESS}, http://{$TAILSCALE_ADDRESS} {
+	redir https://{host}{uri} permanent
+}
+
+https://{$LAN_BIND_ADDRESS}, https://{$TAILSCALE_ADDRESS} {
+	tls /etc/caddy/lan-tls.crt /etc/caddy/lan-tls.key
+	encode zstd gzip
+	reverse_proxy app:8080
+}

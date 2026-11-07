@@ -1,0 +1,24 @@
+--
+-- 030 — per-operator email address for self-service password reset.
+--
+-- Until now the OTP for a password reset went to SMTP_FROM, the deployment's
+-- alerting mailbox, because there was no per-user address to send it to. That
+-- meant every operator's reset code landed in one shared inbox. Each account
+-- now carries its own address, which is where the reset code is delivered.
+--
+-- The column is nullable on purpose. A schema migration cannot know an operator's
+-- email address, and inventing one (username@somewhere) would send reset codes
+-- to a mailbox nobody owns. Existing accounts therefore keep working and are
+-- prompted to add an address; new accounts must provide one (enforced by the
+-- API, not by a NOT NULL that would fail this migration on a populated table).
+--
+-- Not UNIQUE: `users.username` is already the unique login key, and a shared
+-- team mailbox is a legitimate choice for several accounts. Uniqueness would
+-- also turn a duplicate into a 500 on an administrative save.
+--
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+-- The lookup index on users(lower(email)) is built CONCURRENTLY in
+-- migrations/indexes/004_users_email.sql: `users` is populated on every live
+-- installation, and a plain CREATE INDEX here would hold SHARE on the table for
+-- the whole build, blocking logins and failing ingest workers.
+INSERT INTO schema_migrations(version) VALUES(30) ON CONFLICT DO NOTHING;

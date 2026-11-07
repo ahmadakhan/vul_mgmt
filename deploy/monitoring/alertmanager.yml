@@ -1,0 +1,48 @@
+global:
+  resolve_timeout: 5m
+
+# Delivery. VulnStream's alert rules have never reached a human because
+# Prometheus evaluates them and then has nowhere to send them: without an
+# alertmanager block in prometheus.yml, every rule in vulnstream-alerts.yml is
+# evaluated and discarded. This file is the missing receiver.
+route:
+  # Group by severity so one incident is one notification, not one per instance.
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  # A firing alert re-notifies hourly for as long as it stays firing. For an
+  # "always on" requirement, a single notification that can be missed is not
+  # enough.
+  repeat_interval: 1h
+  receiver: default
+  routes:
+    - matchers: [severity="critical"]
+      receiver: critical
+      repeat_interval: 30m
+      continue: true
+
+receivers:
+  # Replace with the operator's real destination. Both forms are shown because
+  # the choice depends on where the deployment can reach: an SMTP relay inside
+  # the network, or a webhook to the on-call provider.
+  - name: default
+    webhook_configs:
+      - url: ${ALERT_WEBHOOK_URL}
+        send_resolved: true
+        max_alerts: 20
+
+  - name: critical
+    webhook_configs:
+      - url: ${ALERT_CRITICAL_WEBHOOK_URL}
+        send_resolved: true
+        max_alerts: 20
+
+inhibit_rules:
+  # A total outage makes every per-instance rule fire at once. Suppress the
+  # downstream noise so the on-call sees one alert, not fifteen.
+  - source_matchers: [alertname="VulnStreamAllInstancesDown"]
+    target_matchers: [job="vulnstream"]
+    equal: [severity]
+  # If the database is gone, "ingestion stalled" is a symptom, not a new cause.
+  - source_matchers: [alertname="VulnStreamDatabaseRecovery"]
+    target_matchers: [alertname="VulnStreamIngestionStalled"]

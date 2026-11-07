@@ -1,0 +1,691 @@
+.product-registration-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 65%);
+  backdrop-filter: blur(5px);
+  outline: none;
+}
+.ui-main .product-registration-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(1080px, 100%);
+  max-height: calc(100dvh - 48px);
+  overflow: hidden;
+  border: 1px solid var(--ui-border);
+  border-radius: 18px;
+  background: var(--ui-surface);
+  color: var(--ui-text);
+  box-shadow: 0 24px 90px rgb(0 0 0 / 28%);
+}
+.registration-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+  padding: 24px 66px 24px 28px;
+  border-bottom: 1px solid var(--ui-divider);
+}
+.registration-header-icon {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--ui-accent) 25%, transparent);
+  border-radius: 13px;
+  color: var(--ui-accent);
+  background: var(--ui-focus);
+}
+.registration-eyebrow {
+  margin-bottom: 5px;
+  color: var(--ui-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.registration-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.35;
+}
+.registration-header #product-registration-description {
+  margin-top: 7px;
+  color: var(--ui-muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.registration-close {
+  position: absolute;
+  top: 24px;
+  right: 24px;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--ui-divider);
+  border-radius: 9px;
+  color: var(--ui-muted);
+}
+.registration-close:hover:not(:disabled) {
+  color: var(--ui-text);
+  background: var(--ui-control-hover);
+}
+.registration-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.registration-body-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 28px;
+  min-height: 0;
+  margin: 0;
+  padding: 26px 28px;
+  border: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.registration-fields,
+.registration-preview {
+  min-width: 0;
+}
+.registration-fields {
+  display: grid;
+  gap: 26px;
+}
+.registration-section {
+  min-width: 0;
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--ui-divider);
+}
+.registration-section:last-of-type {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+.registration-section-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  margin-bottom: 20px;
+}
+.registration-section-heading > span {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  flex-shrink: 0;
+  border: 1px solid var(--ui-divider);
+  border-radius: 8px;
+  color: var(--ui-accent);
+  background: var(--ui-subtle);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.registration-section-heading h3 {
+  color: var(--ui-text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.registration-section-heading p {
+  margin-top: 5px;
+  color: var(--ui-muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.registration-section > div:not(.registration-section-heading) + div {
+  margin-top: 18px;
+}
+.product-registration-dialog label:not(.registration-product-choice) {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--ui-text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.product-registration-dialog :is(input:not([type='checkbox']), select, textarea) {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background-color: var(--ui-control);
+  color: var(--ui-text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.product-registration-dialog textarea {
+  resize: vertical;
+}
+.product-registration-dialog :is(input, select, textarea)::placeholder {
+  color: var(--ui-placeholder);
+}
+.product-registration-dialog :is(input, select, textarea, button, summary):focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 3px;
+}
+.product-registration-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.product-registration-dialog .registration-vendor-shortcuts {
+  gap: 6px;
+  margin-top: 12px;
+}
+.registration-vendor-shortcuts > span {
+  flex-basis: 100%;
+  margin-bottom: 2px;
+  color: var(--ui-muted);
+  font-family: inherit;
+  font-size: 11px;
+}
+.product-registration-dialog .registration-vendor-shortcuts button {
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 1px solid var(--ui-divider);
+  border-radius: 7px;
+  background: var(--ui-subtle);
+  color: var(--ui-muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.registration-vendor-shortcuts button:hover {
+  color: var(--ui-accent);
+  border-color: var(--ui-accent);
+}
+.product-registration-dialog .registration-catalog {
+  padding: 14px;
+  border: 1px solid var(--ui-divider);
+  background: var(--ui-subtle);
+}
+.registration-catalog > div:first-child {
+  gap: 12px;
+  align-items: flex-start;
+}
+.registration-catalog > div:first-child > span {
+  color: var(--ui-text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.registration-catalog > div:first-child > span:last-child {
+  flex-shrink: 0;
+  color: var(--ui-muted);
+  font-size: 11px;
+}
+.product-registration-dialog .registration-catalog-query {
+  min-height: 38px;
+  padding: 8px 11px;
+  font-size: 12px;
+  margin-block: 8px 10px;
+}
+.registration-catalog-options {
+  max-height: 260px;
+  gap: 8px;
+  overscroll-behavior: contain;
+}
+.product-registration-dialog .registration-product-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 60px;
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--ui-control);
+  border-color: var(--ui-divider);
+  color: var(--ui-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.registration-product-choice:has(input:checked) {
+  background: var(--ui-focus);
+  border-color: var(--ui-accent);
+}
+.product-registration-dialog .registration-product-choice > input {
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  flex-shrink: 0;
+  accent-color: var(--ui-accent);
+}
+.registration-product-choice > div {
+  margin-left: 0;
+}
+.registration-product-choice > div > div:first-child {
+  gap: 6px;
+}
+.registration-product-choice > div > div:first-child > span:first-child {
+  white-space: normal;
+  font-weight: 500;
+}
+.registration-product-choice > div > div:last-child {
+  font-size: 11px;
+  color: var(--ui-muted);
+}
+.product-registration-dialog .registration-helper {
+  margin-top: 9px;
+  color: var(--ui-muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.75;
+}
+.registration-section > .grid-cols-3 {
+  grid-template-columns: 1.2fr 1fr 1fr;
+  gap: 14px;
+}
+.registration-nvd > div:first-child {
+  align-items: center;
+  gap: 12px;
+}
+.registration-subheading {
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.product-registration-dialog .registration-nvd > div:first-child button {
+  min-height: 36px;
+  flex-shrink: 0;
+  gap: 7px;
+  padding: 8px 11px;
+  border-color: color-mix(in srgb, var(--ui-accent) 30%, var(--ui-divider));
+  color: var(--ui-accent);
+  background: var(--ui-focus);
+  font-family: inherit;
+  font-size: 12px;
+}
+.registration-nvd > p {
+  color: var(--ui-muted);
+  font-size: 11px;
+  line-height: 1.75;
+}
+.registration-nvd .relative > svg {
+  pointer-events: none;
+}
+.registration-nvd-results {
+  max-height: 300px;
+  overscroll-behavior: contain;
+}
+.product-registration-dialog .registration-nvd-result {
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border-color: var(--ui-divider);
+  background: var(--ui-subtle);
+}
+.registration-nvd-result code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--ui-text);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.registration-nvd-result > div > div:last-child {
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  font-size: 10px;
+  line-height: 1.6;
+}
+.registration-result-title {
+  margin-bottom: 6px;
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.65;
+}
+.product-registration-dialog .registration-nvd-result > button {
+  min-height: 32px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  font-family: inherit;
+  font-size: 11px;
+}
+.product-registration-dialog [role='alert'] {
+  padding: 12px;
+  border-color: #f43f5e55;
+  border-radius: 9px;
+  color: #fda4af;
+  background: #f43f5e0d;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.light .product-registration-dialog [role='alert'] {
+  color: #9f1239;
+}
+.registration-preview {
+  position: sticky;
+  top: 0;
+  max-height: calc(100dvh - 265px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 3px;
+}
+.product-registration-dialog .registration-cpe-preview {
+  padding: 18px;
+  border: 1px solid var(--ui-divider);
+  background: var(--ui-subtle);
+}
+.registration-cpe-preview > div:first-child {
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.registration-cpe-preview > div:first-child > span:first-child {
+  color: var(--ui-text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.registration-cpe-preview > div:first-child > span:last-child {
+  border-color: var(--ui-divider);
+  background: var(--ui-control);
+  color: var(--ui-muted);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+}
+.product-registration-dialog .registration-cpe-list {
+  max-height: 380px;
+}
+.registration-cpe-list > div {
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  background: var(--ui-control);
+  border-color: var(--ui-divider);
+  box-shadow: none;
+}
+.registration-cpe-list > div > div:first-child {
+  min-width: 0;
+  margin: 0;
+  white-space: normal;
+  overflow: visible;
+}
+.registration-cpe-list > div > div:first-child > span {
+  display: block;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.8;
+}
+.registration-cpe-list > div > div:first-child > span:first-child {
+  margin-bottom: 6px;
+  color: var(--ui-muted);
+  font-family: ui-sans-serif, sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+}
+.registration-cpe-list > div > div:last-child {
+  flex-direction: column;
+  gap: 8px;
+}
+.registration-cpe-list button {
+  display: grid;
+  place-items: center;
+  min-width: 26px;
+  min-height: 26px;
+}
+.registration-preview-empty {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding-block: 26px;
+  color: var(--ui-muted);
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.75;
+}
+.product-registration-dialog .registration-preview > label {
+  margin-top: 20px;
+}
+.registration-manual-cpe {
+  align-items: flex-start;
+  gap: 8px;
+}
+.product-registration-dialog .registration-manual-cpe input {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.product-registration-dialog .registration-manual-cpe button {
+  min-height: 44px;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  border-color: var(--ui-border);
+  color: var(--ui-accent);
+  background: var(--ui-focus);
+  font-family: inherit;
+  font-size: 12px;
+}
+.registration-advanced {
+  border: 1px solid var(--ui-divider);
+  border-radius: 10px;
+  background: var(--ui-subtle);
+}
+.registration-advanced summary {
+  padding: 15px;
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.registration-advanced summary > span {
+  margin-left: 8px;
+  color: var(--ui-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.registration-advanced > div {
+  display: grid;
+  gap: 18px;
+  padding: 4px 16px 18px;
+}
+.registration-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px 20px;
+  flex-shrink: 0;
+  padding: 18px 28px;
+  border-top: 1px solid var(--ui-divider);
+  background: var(--ui-subtle);
+}
+.registration-footer-summary {
+  display: grid;
+  gap: 5px;
+}
+.registration-footer-summary strong {
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.registration-footer-summary > span {
+  color: var(--ui-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.registration-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+}
+.product-registration-dialog .registration-footer-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-control);
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.product-registration-dialog .registration-footer-actions button[type='submit'] {
+  border-color: transparent;
+  background: #4b6ad5;
+  color: white;
+  box-shadow: 0 2px 4px rgb(25 45 105 / 12%);
+}
+.product-registration-dialog .registration-footer-actions button[type='submit']:hover:not(:disabled) {
+  background: #3e5fc8;
+}
+.registration-footer > [role] {
+  grid-column: 1 / -1;
+  order: -1;
+}
+@media (max-width: 900px) {
+  .product-registration-overlay {
+    padding: 16px;
+  }
+  .ui-main .product-registration-dialog {
+    max-height: calc(100dvh - 32px);
+  }
+  .registration-body-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+    padding: 24px;
+  }
+  .registration-preview {
+    position: static;
+    max-height: none;
+    padding: 0;
+    overflow: visible;
+  }
+  .registration-section > .grid-cols-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .registration-catalog-options {
+    max-height: 220px;
+  }
+}
+@media (max-width: 600px) {
+  .product-registration-overlay {
+    padding: 10px;
+  }
+  .ui-main .product-registration-dialog {
+    max-height: calc(100dvh - 20px);
+    border-radius: 14px;
+  }
+  .registration-header {
+    align-items: flex-start;
+    gap: 11px;
+    padding: 20px 52px 18px 18px;
+  }
+  .registration-header-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+  }
+  .registration-header h2 {
+    font-size: 17px;
+  }
+  .registration-header #product-registration-description {
+    font-size: 11px;
+  }
+  .registration-eyebrow {
+    font-size: 9px;
+  }
+  .registration-close {
+    top: 16px;
+    right: 14px;
+    width: 30px;
+    height: 30px;
+  }
+  .registration-body-grid {
+    padding: 22px 18px;
+  }
+  .registration-section-heading {
+    gap: 9px;
+  }
+  .registration-section > .grid-cols-3 {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
+  }
+  .registration-catalog > div:first-child {
+    flex-wrap: wrap;
+  }
+  .registration-catalog-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .registration-footer {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+    padding: 15px 18px;
+  }
+  .registration-footer-summary {
+    gap: 3px;
+  }
+  .registration-footer-summary strong {
+    display: none;
+  }
+  .registration-footer-summary > span {
+    font-size: 10px;
+  }
+  .registration-footer-actions {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .product-registration-dialog .registration-footer-actions button {
+    padding-inline: 12px;
+  }
+  .registration-nvd > div:first-child {
+    flex-wrap: wrap;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .product-registration-dialog .animate-spin {
+    animation: none;
+  }
+}
+.registration-body-grid {
+  min-width: 0;
+}
+
+.registration-form {
+  flex: 1;
+  overflow: hidden;
+}
+.registration-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.registration-body-grid {
+  overflow: visible;
+}
+.monitored-inventory-actions {
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 100%;
+}
+.monitored-inventory-actions > button {
+  margin: 0;
+}

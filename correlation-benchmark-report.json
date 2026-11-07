@@ -1,0 +1,24 @@
+{
+  "items": 500,
+  "concurrency": 4,
+  "elapsedMs": 9889,
+  "itemsPerSecond": 50.56152399397055,
+  "latencyMs": {
+    "p50": 74.39928799999961,
+    "p95": 125.67954700000018,
+    "p99": 150.03371000000016
+  },
+  "peakWorkers": 4,
+  "peakRssMiB": 176.06640625,
+  "results": {
+    "PROCESSED": 450,
+    "DUPLICATE": 50,
+    "DEAD_LETTER": 0
+  },
+  "uniqueArticles": 450,
+  "checks": {
+    "boundedWorkers": true,
+    "noDeadLetters": true,
+    "exactlyOnce": true
+  }
+}

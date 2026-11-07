@@ -1,0 +1,140 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vulnstream
+      POSTGRES_USER: vulnstream_migrator
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a strong migration database password}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set a strong runtime database password}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/01-runtime-role.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U vulnstream_migrator -d vulnstream]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+  migrate:
+    build: .
+    command: [node, server-dist/migrate.js]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://vulnstream_migrator:${POSTGRES_PASSWORD:?Set migration password}@db:5432/vulnstream
+      GRANT_RUNTIME_ROLE: 'true'
+    networks: [backend]
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_OPTIONS: --max-old-space-size=320
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgresql://vulnstream_app:${APP_DB_PASSWORD:?Set runtime password}@db:5432/vulnstream
+      APP_ORIGIN: https://${APP_HOST:?Set public hostname}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a base64 32-byte encryption key}
+      ENCRYPTION_KEYS: ${ENCRYPTION_KEYS:-}
+      ML_SIGNING_KEY: ${ML_SIGNING_KEY:-}
+      EGRESS_ALLOWED_HOSTS: ${EGRESS_ALLOWED_HOSTS-raw.githubusercontent.com,services.nvd.nist.gov,api.osv.dev,www.googleapis.com,www.cisa.gov,cisa.gov,api.first.org,api.github.com,app.opencve.io,api.vulncheck.com,otx.alienvault.com,send.api.mailtrap.io,sandbox.api.mailtrap.io,api.sendgrid.com,smtp.sendgrid.net,api.postmarkapp.com,smtp.maileroo.com,smtp.lettr.com,api.mailgun.net,api.eu.mailgun.net,in-v3.mailjet.com,api.mailjet.com,smtp.gmail.com,www.bleepingcomputer.com,isc.sans.edu,api.msrc.microsoft.com,www.fortiguard.com,filestore.fortinet.com,www.kb.cert.org,kb.cert.org,thehackernews.com,feeds.feedburner.com,www.securityweek.com,www.rapid7.com,googleprojectzero.blogspot.com,projectzero.google,krebsonsecurity.com,tools.cisco.com,sec.cloudapps.cisco.com,security.paloaltonetworks.com,labs.watchtowr.com,www.talosintelligence.com,blog.talosintelligence.com,www.thezdi.com,www.exploit-db.com,www.debian.org,www.cisecurity.com,cisecurity.com,cisecurity.org,www.cisecurity.org,seclists.org,blog.sucuri.net,www.welivesecurity.com,wordpress.org,www.darkreading.com,blog.google,cloud.google.com,docs.cloud.google.com,workspace.google.com,www.greynoise.io,www.malwarebytes.com,cloudblog.withgoogle.com,www.sophos.com,therecord.media,blog.twitter.com,blog.x.com,github.com,github.blog,www.pentestpartners.com,www.forbes.com,www.theregister.com,api.theregister.com,news.google.com,www.cve.org,cve.org,support.apple.com,helpx.adobe.com,access.redhat.com,security.redhat.com,usn.ubuntu.com,www.crowdstrike.com,crowdstrike.com,securelist.com,www.securelist.com,psirtapi.global.sonicwall.com,psirt.global.sonicwall.com}
+      # Redirect targets of the feeds above (for example www.cisecurity.com ->
+      # cisecurity.org -> www.cisecurity.org). Each hop is re-validated against
+      # the allowlist, so a target missing here fails the feed.
+      EGRESS_ALLOWED_HOSTS_EXTRA: ${EGRESS_ALLOWED_HOSTS_EXTRA-}
+      TRUST_PROXY: ${TRUST_PROXY:-loopback,linklocal,uniquelocal}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      FEED_MAX_DURATION_SECONDS: ${FEED_MAX_DURATION_SECONDS:-1800}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      WORKER_ENABLED: 'true'
+      CORRELATION_DLQ_DIRECTORY: /var/lib/vulnstream/deadletters
+      CORRELATION_DLQ_STORAGE_MODE: database
+      ML_DIRECTORY: /var/lib/vulnstream/ml
+      ML_STORAGE_MODE: database
+    volumes:
+      # Legacy sources are imported and pruned after their PostgreSQL copy commits.
+      - correlation-deadletters:/var/lib/vulnstream/deadletters
+      - ml-models:/var/lib/vulnstream/ml
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 35s
+    networks: [backend, egress]
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=512MB
+    secrets:
+      - source: vulnstream_metrics_token
+        target: vulnstream_metrics_token
+    ports: ['127.0.0.1:${PROMETHEUS_PORT:-9091}:9090']
+    volumes:
+      - prometheus-data:/prometheus
+      - ./deploy/monitoring/prometheus-compose.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/vulnstream-alerts.yml:/etc/prometheus/vulnstream-alerts.yml:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:9090/-/ready]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [backend, egress]
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    environment:
+      APP_HOST: ${APP_HOST:?Set public hostname}
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [backend, egress]
+volumes:
+  postgres-data:
+  prometheus-data:
+  correlation-deadletters:
+  ml-models:
+  caddy-data:
+  caddy-config:
+networks:
+  backend:
+    internal: true
+  egress:
+
+secrets:
+  vulnstream_metrics_token:
+    file: ./.runtime/metrics.token

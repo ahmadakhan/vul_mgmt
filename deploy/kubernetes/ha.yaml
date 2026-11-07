@@ -1,0 +1,146 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vulnstream-headless
+spec:
+  clusterIP: None
+  selector: {app: vulnstream}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vulnstream
+spec:
+  selector: {app: vulnstream}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vulnstream
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: vulnstream}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vulnstream
+spec:
+  serviceName: vulnstream-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: vulnstream}
+  template:
+    metadata:
+      labels: {app: vulnstream}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: vulnstream}
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: migrate
+          image: vulnstream-enterprise:local-verified
+          imagePullPolicy: IfNotPresent
+          command: [node, server-dist/migrate.js]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: MIGRATION_DATABASE_URL}
+            - {name: GRANT_RUNTIME_ROLE, value: 'true'}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 256Mi}
+      containers:
+        - name: app
+          image: vulnstream-enterprise:local-verified
+          imagePullPolicy: IfNotPresent
+          args: [node, --max-old-space-size=320, server-dist/main.js]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: DATABASE_URL}
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: ENCRYPTION_KEY}
+            - name: APP_ORIGIN
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: APP_ORIGIN}
+            - name: METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: METRICS_TOKEN}
+            - {name: NODE_ENV, value: production}
+            - {name: PORT, value: '8080'}
+            - {name: WORKER_ENABLED, value: 'true'}
+            - {name: CORRELATION_DLQ_DIRECTORY, value: /var/lib/vulnstream/deadletters}
+            # Dead-man's switch. Optional: delete both env entries to disable it.
+            # The receiver must be OUTSIDE this cluster, or a total outage takes
+            # it down too and no alert is raised.
+            - name: HEARTBEAT_URL
+              valueFrom:
+                secretKeyRef: {name: vulnstream-runtime, key: HEARTBEAT_URL, optional: true}
+            - {name: HEARTBEAT_INTERVAL_SECONDS, value: '60'}
+            # A 10s event-loop block is reported as 503 by /live. Only enable
+            # this where the probe timeout below is comfortably larger.
+            - {name: HANG_DETECTION_ENABLED, value: 'true'}
+          ports:
+            - {name: http, containerPort: 8080}
+          startupProbe:
+            httpGet: {path: /live, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            # /ready fails when the pipeline cannot admit (database recovery or an
+            # open breaker), so a wedged consumer is taken out of the load
+            # balancer instead of silently dropping advisories.
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            # /live answers 503 only when the event loop itself has stalled. The
+            # threshold is 10s, so 4 x 10s gives a 40s window before a restart.
+            httpGet: {path: /live, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 8
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: '2', memory: 512Mi}
+          volumeMounts:
+            - {name: deadletters, mountPath: /var/lib/vulnstream/deadletters}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: deadletters
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
