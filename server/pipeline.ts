@@ -1900,11 +1900,17 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
       }
       // Include limited-confidence findings in the SAME recipient email as
       // confirmed findings. The renderer explains the confidence and its reason.
+      //
+      // `reviewNotifiedAt` is deliberately NOT a filter here (audit follow-up,
+      // Finding 1): it is a GLOBAL stamp set when any recipient's email was
+      // accepted, so filtering on it dropped findings for every recipient who
+      // had not been told yet — including recipients added later. The
+      // per-recipient `delivery_claims` record inside the consolidated queue is
+      // what decides whether THIS recipient still needs THIS finding.
       const pending = vexEnforced.filter(
         (f) =>
           ['QUEUED_FOR_DISPATCH', 'AUTO_DISPATCHED', 'REVIEW_REQUIRED'].includes(f.notificationStatus) &&
           !f.advisoryId &&
-          !f.reviewNotifiedAt &&
           !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(f.status),
       );
       // ML-guided finding order: use the trained importance ranker when

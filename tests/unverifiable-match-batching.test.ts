@@ -199,7 +199,7 @@ test('a recipient added after another was notified still receives the finding', 
     assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
     // The first recipient's email is accepted: the finding is stamped globally.
     await put(pool, 'findings', entry.id, { ...entry, reviewNotifiedAt: new Date().toISOString() });
-    await markClaimsDelivered(pool, claimsForJob(analyst.id, 'finding', [entry.id]));
+    await markClaimsDelivered(pool, claimsForJob(analyst.id, 'finding', [entry.id]), { jobId: randomUUID() });
 
     // A new recipient is added the following day.
     const newcomer = recipient('r2', 'newcomer@example.invalid', 'SECURITY_TEAM');
@@ -253,36 +253,163 @@ test('a terminally failed delivery releases its claims so the finding is re-queu
     const entry = finding('CVE-2026-14001', 'f1', 'server-1', 'acme', 'widget');
     assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
     // Simulate the terminal failure the delivery worker records: the job is
-    // marked FAILED and its claims are released.
+    // marked FAILED without any transport acceptance and its claims are released.
     await pool.query("UPDATE outbox SET status='FAILED', error='transport rejected'");
-    await releaseClaims(pool, claimsForJob(target.id, 'finding', [entry.id]));
+    const FAILED_JOB_HINT = (
+      await pool.query<{ id: string }>("SELECT id FROM outbox WHERE advisory_id LIKE 'FINDINGS:%' LIMIT 1")
+    ).rows[0]?.id;
+    await releaseClaims(pool, claimsForJob(target.id, 'finding', [entry.id]), { jobId: FAILED_JOB_HINT });
     // A later run re-queues the finding. The batch is identical, so the outbox
-    // dedupe key matches the FAILED row; `enqueue` only re-opens a failed job
-    // whose findings became inapplicable, so the run reports nothing queued and
-    // the claim is released again rather than left blocking the finding.
-    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 0);
+    // dedupe key matches the FAILED row; `enqueue` re-opens the failed job
+    // because it carries no confirmed transport acceptance, and the run delivers
+    // a replacement email (audit follow-up, Finding 2).
     assert.equal(
-      (await pool.query("SELECT count(*)::int AS n FROM delivery_claims WHERE state='CLAIMED'")).rows[0].n,
+      await queueConsolidatedFindingNotifications(pool, [entry]),
+      1,
+      'the failed notification is re-queued as a replacement email',
+    );
+    const reopened = await pool.query<{ status: string }>('SELECT status FROM outbox');
+    assert.equal(reopened.rows[0].status, 'QUEUED', 'the failed job is reopened, preserving its identity');
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('claim expiry follows the outbox lifecycle, not just the clock', { skip: !url }, async () => {
+  const outcome = await withDatabase(async (pool) => {
+    // A claim is only reclaimable when its owning outbox job is gone. A queued
+    // job holds its item no matter how old the claim is (Finding 4).
+    const jobId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'expiry-test','email','r1','FINDINGS:test','{}'::jsonb,'QUEUED')
+         RETURNING id`,
+      )
+    ).rows[0].id;
+    const request = claimsForJob('r1', 'finding', ['f1']);
+    const first = await claimItems(pool, request, { jobId });
+    assert.equal(first.granted.length, 1);
+    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 minute'");
+    assert.equal(
+      (await claimItems(pool, request)).granted.length,
       0,
-      'a failed delivery leaves no claim behind',
+      'an expired claim backed by a QUEUED job is never reclaimed',
+    );
+    // Same for a job still SENDING.
+    await pool.query("UPDATE outbox SET status='SENDING' WHERE id=$1", [jobId]);
+    assert.equal(
+      (await claimItems(pool, request)).granted.length,
+      0,
+      'an expired claim backed by a SENDING job is never reclaimed',
+    );
+    // A FAILED job with no confirmed transport acceptance holds the claim until
+    // the finalize path releases it explicitly.
+    await pool.query("UPDATE outbox SET status='FAILED', error='transport rejected' WHERE id=$1", [jobId]);
+    assert.equal(
+      (await claimItems(pool, request)).granted.length,
+      0,
+      'an expired claim backed by a FAILED job is held until it is released',
+    );
+    // Once the job is gone (retention) the claim is reclaimable.
+    await pool.query('DELETE FROM outbox WHERE id=$1', [jobId]);
+    assert.equal(
+      (await claimItems(pool, request)).granted.length,
+      1,
+      'an expired claim with no live job is re-taken',
+    );
+    await markClaimsDelivered(pool, request, { jobId: randomUUID() });
+    await pool.query('DELETE FROM outbox');
+    assert.equal(
+      (await claimItems(pool, request)).granted.length,
+      0,
+      'a delivered claim is permanent',
     );
     return true;
   });
   assert.ok(outcome, 'database-backed test ran');
 });
 
-test('an expired claim is re-taken instead of suppressing the finding forever', { skip: !url }, async () => {
+test('releaseClaims only deletes the claims owned by the given job', { skip: !url }, async () => {
   const outcome = await withDatabase(async (pool) => {
+    // An expired claim that another job re-took must not be deleted by the
+    // stale owner's failure path (audit follow-up, Finding 5).
+    const staleJob = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'stale','email','r1','FINDINGS:stale','{}'::jsonb,'QUEUED') RETURNING id`,
+      )
+    ).rows[0].id;
+    const newerJob = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'newer','email','r1','FINDINGS:newer','{}'::jsonb,'QUEUED') RETURNING id`,
+      )
+    ).rows[0].id;
+    const request = claimsForJob('r1', 'finding', ['f1']);
+    assert.equal((await claimItems(pool, request, { jobId: staleJob })).granted.length, 1);
+    // The stale job fails terminally and releases its claim.
+    await pool.query("UPDATE outbox SET status='FAILED' WHERE id=$1", [staleJob]);
+    assert.equal(await releaseClaims(pool, request, { jobId: staleJob }), 1);
+    // Another job takes the item and fails; its claim then expires but the
+    // finalize path has not run yet, so it is still held.
+    assert.equal((await claimItems(pool, request, { jobId: newerJob })).granted.length, 1);
+    await pool.query("UPDATE outbox SET status='FAILED' WHERE id=$1", [newerJob]);
+    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 hour'");
+    // The stale owner's failure path runs late and tries to delete the claim.
+    assert.equal(
+      await releaseClaims(pool, request, { jobId: staleJob }),
+      0,
+      'a stale owner cannot delete another job\'s claim',
+    );
+    assert.equal(
+      (await pool.query("SELECT count(*)::int AS n FROM delivery_claims WHERE item_id='f1'")).rows[0].n,
+      1,
+      'the newer job\'s claim survives',
+    );
+    // The actual owner can release it.
+    assert.equal(await releaseClaims(pool, request, { jobId: newerJob }), 1);
+    assert.equal(
+      (await pool.query("SELECT count(*)::int AS n FROM delivery_claims WHERE item_id='f1'")).rows[0].n,
+      0,
+    );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('a partially contested batch still delivers the granted findings', { skip: !url }, async () => {
+  // Finding 3: finding A is claimed by another email, finding B is new. The
+  // batch must deliver B instead of being suppressed entirely.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
     const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
-    const request = claimsForJob(target.id, 'finding', ['f1']);
-    const first = await claimItems(pool, request);
-    assert.equal(first.granted.length, 1);
-    assert.equal((await claimItems(pool, request)).granted.length, 0, 'a live claim blocks a second run');
-    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 minute'");
-    assert.equal((await claimItems(pool, request)).granted.length, 1, 'an expired claim is re-taken');
-    await markClaimsDelivered(pool, request);
-    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 minute'");
-    assert.equal((await claimItems(pool, request)).granted.length, 0, 'a delivered claim is permanent');
+    await put(pool, 'recipients', target.id, target);
+    const contested = finding('CVE-2026-15001', 'fA', 'server-1', 'acme', 'widget');
+    const fresh = finding('CVE-2026-15002', 'fB', 'server-2', 'acme', 'widget');
+    // Another run claims finding A first.
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [contested]), 1);
+    // This run queues a batch containing both.
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [contested, fresh]),
+      1,
+      'the granted finding is delivered despite the denied one',
+    );
+    const rows = (
+      await pool.query<{ payload: { includedFindingIds: string[] } }>(
+        "SELECT payload FROM outbox WHERE advisory_id LIKE 'FINDINGS:%' ORDER BY created_at",
+      )
+    ).rows;
+    assert.deepEqual(rows[1].payload.includedFindingIds, [fresh.id], 'only the granted finding is carried');
+    // The contested finding stays claimed by its original job.
+    assert.equal(
+      (
+        await pool.query(
+          "SELECT count(*)::int AS n FROM delivery_claims WHERE item_id='fA' AND state='CLAIMED'",
+        )
+      ).rows[0].n,
+      1,
+      'the denied finding\'s claim is untouched',
+    );
     return true;
   });
   assert.ok(outcome, 'database-backed test ran');

@@ -776,12 +776,23 @@ export async function enqueue(
     if (settings.emailEnabled === false) return null;
   }
   const id = randomUUID();
-  // A content revision that already exists is normally a duplicate. The one
-  // safe exception is a bundle that was terminally failed because its findings
-  // were temporarily inapplicable: the pipeline only calls queueAdvisory again
-  // after revalidating the current inventory, so the same revision can be
-  // re-opened without ever having been accepted by a transport. Transport,
-  // recipient, and subscription failures are deliberately not resurrected.
+  // A content revision that already exists is normally a duplicate. Two safe
+  // exceptions allow re-opening a FAILED job, and both require that no transport
+  // ever confirmed an acceptance (provider_id is empty — an acceptance is a fact
+  // and must never be re-sent):
+  //
+  //  - a bundle terminally failed because its findings were temporarily
+  //    inapplicable: the pipeline only calls queueAdvisory again after
+  //    revalidating the current inventory;
+  //  - a consolidated notification batch (FINDINGS:/NEWS:) whose delivery failed
+  //    terminally. The per-recipient claims are released by the finalize path
+  //    exactly when the failure is provably non-delivery, so a later run
+  //    re-claims the items and must be able to queue a replacement email.
+  //    Without this the dedupe key blocked the replacement forever and the
+  //    notification was lost (audit follow-up, Finding 2). The original failure
+  //    stays in the audit/events trail; uncertain transport outcomes (provider
+  //    lookup inconclusive, prior attempt possibly accepted) are never re-opened
+  //    here — they are held for the confirm-prior-delivery check on retry.
   const inserted = await db.query(
     `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,priority,edits)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
@@ -799,8 +810,17 @@ export async function enqueue(
        lock_token=NULL,
        updated_at=now()
      WHERE outbox.status='FAILED'
-       AND (COALESCE(outbox.error,'') LIKE '%no longer applicable%'
-         OR (outbox.advisory_id LIKE 'UNVERIFIABLE:%' AND COALESCE(outbox.error,'') LIKE 'Review notification%'))
+       AND COALESCE(outbox.provider_id,'')=''
+       AND (
+         COALESCE(outbox.error,'') LIKE '%no longer applicable%'
+         OR (outbox.advisory_id LIKE 'UNVERIFIABLE:%' AND COALESCE(outbox.error,'') LIKE 'Review notification%')
+         OR (
+            (outbox.advisory_id LIKE 'FINDINGS:%' OR outbox.advisory_id LIKE 'NEWS:%')
+            AND COALESCE(outbox.error,'') NOT LIKE '%already accepted by the transport%'
+            AND COALESCE(outbox.error,'') NOT LIKE '%could not be confirmed%'
+            AND COALESCE(outbox.error,'') NOT LIKE '%outcome could not be confirmed%'
+         )
+       )
      RETURNING id`,
     [
       id,
@@ -1261,26 +1281,66 @@ export async function queueConsolidatedFindingNotifications(
     // Claim and enqueue atomically. A concurrent run that claimed any of these
     // findings first makes this transaction roll back, so the loser queues
     // nothing and the winner's message is the only one that carries them.
+    //
+    // A denied claim never blocks the granted ones (audit follow-up, Finding 3):
+    // the message is built from the claims this run actually won, so unrelated
+    // new findings are still delivered instead of being suppressed alongside the
+    // contested one. The claims of a denied item are never taken, so there is
+    // nothing to roll back for it.
     const enqueueWithClaim = async (tx: Db) => {
       const claim = await claimItems(tx, claimsForJob(recipient.id, 'finding', findingIds));
-      if (claim.denied.length) return null;
+      if (!claim.granted.length) return null;
+      const granted = new Set(claim.granted.map((request) => request.itemId));
+      const owned = permitted.filter((finding) => granted.has(finding.id));
+      const ownedIds = owned.map((finding) => finding.id);
+      const ownedBucket = consolidatedFindingBatchId(ownedIds);
+      const ownedCache = documentCache.get(ownedBucket);
+      const ownedDocument = ownedCache ?? (() => {
+        const { advisory, document } = consolidatedFindingsDocument(owned, generatedAt);
+        const evidence = deliveryRevisionEvidence(owned);
+        const builtPayload = {
+          payload: {
+            ...document,
+            cveIds: advisory.cveIds,
+            includedFindingIds: ownedIds,
+            ...evidence,
+            contentRevision: createHash('sha256')
+              .update(stableJson({ findingIds: [...ownedIds].sort(), ...evidence }))
+              .digest('hex')
+              .slice(0, 20),
+            generatedAt: generatedAt.toISOString(),
+            digestKey: advisory.id,
+          },
+          priority: advisoryPriority(owned),
+        } as { payload: Job['payload']; priority: number };
+        documentCache.set(ownedBucket, builtPayload);
+        return builtPayload;
+      })();
       const id = await enqueue(
         tx,
         'email',
         recipient.id,
-        `FINDINGS:${bucket}`,
-        { ...built!.payload, recipientEmail: recipient.email },
-        `findings:${built!.payload.contentRevision}:email:${recipient.id}`,
+        `FINDINGS:${ownedBucket}`,
+        { ...ownedDocument.payload, recipientEmail: recipient.email },
+        `findings:${ownedDocument.payload.contentRevision}:email:${recipient.id}`,
         'QUEUED',
-        built!.priority,
+        ownedDocument.priority,
       );
       if (!id) {
-        // An identical message is already queued (dedupe key matched). Release
-        // the claims so a later run with a different batch can still deliver.
-        await releaseClaims(tx, claimsForJob(recipient.id, 'finding', findingIds));
+        // An identical message already exists under the same dedupe key. If it
+        // is QUEUED/SENDING, the claims stay with that job — a run that lost the
+        // race must not release its winner's claims. If it is terminally FAILED
+        // without a confirmed transport acceptance, `enqueue` has re-opened it as
+        // this run's job and the claims now belong to the new id.
+        const prior = await tx.query<{ status: string; id: string }>(
+          `SELECT id,status FROM outbox WHERE dedupe_key=$1`,
+          [`findings:${ownedDocument.payload.contentRevision}:email:${recipient.id}`],
+        );
+        if (prior.rows[0] && prior.rows[0].status === 'FAILED')
+          await releaseClaims(tx, claimsForJob(recipient.id, 'finding', ownedIds));
         return null;
       }
-      await attachClaimsToJob(tx, id, claimsForJob(recipient.id, 'finding', findingIds));
+      await attachClaimsToJob(tx, id, claimsForJob(recipient.id, 'finding', ownedIds));
       return id;
     };
     // The caller may already be inside a transaction (the pipeline runs the
@@ -2159,7 +2219,9 @@ export async function deliverNext(
     carriedFindingIds = job.payload.includedFindingIds ?? [];
     droppedFindingIds = declaredFindingIds.filter((id) => !carriedFindingIds.includes(id));
     if (job.channel === 'email' && droppedFindingIds.length)
-      await releaseClaims(db, claimsForJob(job.target_id, 'finding', droppedFindingIds));
+      await releaseClaims(db, claimsForJob(job.target_id, 'finding', droppedFindingIds), {
+        jobId: job.id,
+      });
     await db.query(
       `UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now()
          ${rebuiltPayload ? ',payload=$6::jsonb' : ''} WHERE id=$1`,
@@ -2399,12 +2461,14 @@ export async function deliverNext(
       );
     }
     // A terminally failed delivery never reached the recipient: release the
-    // claims this job owns so the next run re-queues the findings instead of
-    // losing them. Claims of dropped findings are released above.
+    // claims THIS job owns so the next run re-queues the findings instead of
+    // losing them. Ownership is enforced — an expired claim that another job has
+    // since taken is not deleted by the stale owner (audit follow-up, Finding 5).
     if (job.channel === 'email' && error && failed) {
-      const undelivered = carriedFindingIds;
-      if (undelivered.length)
-        await releaseClaims(db, claimsForJob(job.target_id, 'finding', undelivered));
+      if (carriedFindingIds.length)
+        await releaseClaims(db, claimsForJob(job.target_id, 'finding', carriedFindingIds), {
+          jobId: job.id,
+        });
     }
 // After a Security-team delivery is confirmed ACCEPTED, queue the same
     // email for Everyone-group recipients. This is the deferred half of the
@@ -2425,9 +2489,10 @@ export async function deliverNext(
         await recordNewsDeliveries(db, job.target_id, job.advisory_id,
           job.payload.newsEvidence.articles, acceptedAt);
       } else if (failed) {
-        // The recipient never received these articles: free the claims so the
-        // next run re-queues them instead of losing them.
-        await releaseClaims(db, articleClaims);
+        // The recipient never received these articles: free THIS job's claims so
+        // the next run re-queues them instead of losing them. Ownership is
+        // enforced, exactly as for findings.
+        await releaseClaims(db, articleClaims, { jobId: job.id });
       }
     }
     await writeEvent(db, {

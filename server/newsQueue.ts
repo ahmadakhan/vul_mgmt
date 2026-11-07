@@ -263,26 +263,55 @@ export async function queueConsolidatedNews(
     // the enqueue share that transaction. Otherwise a transaction is opened here.
     const enqueueWithClaim = async (tx: Db) => {
       const claim = await claimItems(tx, claimRequests);
-      if (claim.denied.length) return null;
+      if (!claim.granted.length) return null;
+      // A denied claim never blocks the granted ones (audit follow-up, Finding
+      // 3): the message carries only the articles this run actually won, so
+      // unrelated new articles are still delivered. Denied items were never
+      // claimed by this run, so there is nothing to roll back for them.
+      const grantedIdentities = new Set(claim.granted.map((request) => request.itemId));
+      const owned = own.filter((item) => grantedIdentities.has(newsArticleIdentity(item.article)));
+      const ownedRequests = claim.granted;
+      const ownedDocument = renderConsolidatedNewsEmailWithin(owned);
+      const ownedCveIds = [...new Set(owned.flatMap((item) => item.cveIds))].sort();
+      const ownedArticleIds = owned.map((item) => item.article.id).sort();
+      const ownedRevision = createHash('sha256')
+        .update(
+          stableJson({
+            recipientId: recipient.id,
+            articleIds: ownedArticleIds,
+            articleIdentities: owned.map((item) => newsArticleIdentity(item.article)).sort(),
+          }),
+        )
+        .digest('hex')
+        .slice(0, 20);
       const id = await deps.enqueue({
         db: tx,
         recipient,
-        articles: own,
-        subject: document.subject,
-        text: document.text,
+        articles: owned,
+        subject: ownedDocument.subject,
+        text: ownedDocument.text,
         // The HTML is always the styled document; the size budget guarantees it
         // is attachable, and the plain text is only ever the alternative part.
-        html: document.html,
-        cveIds,
-        contentRevision,
-        identity,
-        advisoryId,
+        html: ownedDocument.html,
+        cveIds: ownedCveIds,
+        contentRevision: ownedRevision,
+        identity: `news:${recipient.id}:${articleSetFingerprint(ownedArticleIds)}`,
+        advisoryId: `NEWS:${ownedArticleIds.join(',')}`.slice(0, 512),
       });
       if (!id) {
-        await releaseClaims(tx, claimRequests);
+        // An identical message already exists under this dedupe key. Keep the
+        // claims with the existing QUEUED/SENDING job; only release them when
+        // the prior job FAILED without a confirmed transport acceptance, in
+        // which case `enqueue` re-opened it as this run's job.
+        const prior = await tx.query<{ status: string }>(
+          `SELECT status FROM outbox WHERE dedupe_key=$1`,
+          [`news:${recipient.id}:${articleSetFingerprint(ownedArticleIds)}:email:${recipient.id}`],
+        );
+        if (prior.rows[0]?.status === 'FAILED')
+          await releaseClaims(tx, ownedRequests);
         return null;
       }
-      await attachClaimsToJob(tx, id, claimRequests);
+      await attachClaimsToJob(tx, id, ownedRequests);
       return id;
     };
     const queuedId = isPool(db) ? await transaction(db, enqueueWithClaim) : await enqueueWithClaim(db);
