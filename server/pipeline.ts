@@ -362,7 +362,6 @@ export async function regroupStaleAdvisory(
       const cveRevisions: Record<string, string> = {};
       const findingRevisions: Record<string, string> = {};
       const current: Finding[] = [];
-      let held = false;
       for (const finding of findings) {
         const cve = cves.get(finding.cveId) || finding.cve;
         const asset = assets.get(finding.matchedAssetId);
@@ -389,8 +388,9 @@ export async function regroupStaleAdvisory(
           undefined,
           aliasEntries,
         ).newFindings[0];
-        if (match?.notificationStatus === 'REVIEW_REQUIRED') held = true;
-        if (match?.notificationStatus !== 'QUEUED_FOR_DISPATCH') {
+        // Limited-confidence matches are dispatched too (the email states the
+        // limitation), so they are admitted exactly like QUEUED_FOR_DISPATCH.
+        if (match?.notificationStatus !== 'QUEUED_FOR_DISPATCH' && match?.notificationStatus !== 'REVIEW_REQUIRED') {
           continue;
         }
         const fresh = { ...finding, ...match, id: finding.id };
@@ -399,7 +399,6 @@ export async function regroupStaleAdvisory(
       }
       deliverability.set(job.id, current.length > 0);
       evidence.set(job.id, { cveRevisions, findingRevisions, findings: current });
-      holdGated ||= held;
     }
     const regroup = jobs.filter((job) => deliverability.get(job.id));
     if (!regroup.length) return { regrouped: false, holdGated };
