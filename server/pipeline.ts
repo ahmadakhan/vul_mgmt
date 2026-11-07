@@ -728,7 +728,8 @@ export async function processPipeline(pool: pg.Pool, config: Config, request: Re
       const schedulerNow = Date.now();
       const catchUpDue = settings.schedulerEnabled && (await list<FeedCursor>(pool, 'feedCursors')).some((cursor) => {
         if (!cursor.hasMore) return false;
-        const nextCatchupAt = cursor.next_catchup_at ? Date.parse(cursor.next_catchup_at) : NaN;
+        if (!cursor.next_catchup_at) return false;
+        const nextCatchupAt = Date.parse(cursor.next_catchup_at);
         return !Number.isFinite(nextCatchupAt) || nextCatchupAt <= schedulerNow;
       });
       const recoveryProbeDue = !settings.schedulerEnabled &&
