@@ -1413,9 +1413,13 @@ export async function queueZeroDayDigestNotification(
     `${lines.join('\n\n')}${sources}\n\n` +
     'This is applicability evidence, not a confirmed advisory. Confirm source authenticity and consult the vendor before remediation.';
   const articleIds = digest.articles.map((article) => article.id).sort();
+  // Identity is the set of source articles, not the match rows: a re-correlation
+  // of the same articles produces new match ids, and keying on those re-sent the
+  // whole digest to every recipient. A genuinely new article still changes the
+  // identity and sends a new digest.
   const evidenceRevision = articleIds.join(',') || 'no-articles';
-  const contentRevision = `${digest.digestId}:${digest.matchIds.slice().sort().join(',')}:${evidenceRevision}`;
-  const identity = `zeroday:${digest.digestId}:${contentRevision}`;
+  const identity = `zeroday:${digest.digestId}:${evidenceRevision}`;
+  const contentRevision = evidenceRevision;
   const payload: ZeroDayDigestPayload = {
     ...digest,
     articles: digest.articles.map((article) => ({ ...article, sourceFeeds: [...article.sourceFeeds] })),

@@ -418,6 +418,10 @@ export async function runDailyDigest(pool: pg.Pool): Promise<number> {
         // made the whole digest fail as stale every day (and, because the
         // findings stay held, repeat on the next day too). Held findings remain
         // available for operator review; they are not summarised in the email.
+        // A finding that is already queued, sent, or held for review is carried by
+        // its own consolidated findings email. Repeating it here delivered every
+        // alert twice a day, so the summary only covers findings no other email
+        // includes.
         const candidates: Finding[] = findingRows.rows
           .map((r) => r.data)
           .filter(
@@ -427,7 +431,11 @@ export async function runDailyDigest(pool: pg.Pool): Promise<number> {
               !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(f.status) &&
               !['NOT_APPLICABLE', 'SUPPRESSED_VEX_NOT_AFFECTED', 'DELIVERY_FAILED'].includes(
                 f.notificationStatus,
-              ),
+              ) &&
+              !['QUEUED_FOR_DISPATCH', 'AUTO_DISPATCHED', 'DELIVERED', 'REVIEW_REQUIRED'].includes(
+                f.notificationStatus,
+              ) &&
+              !f.advisoryId,
           );
 
         // Reassess against today's inventory and policy, including findings
