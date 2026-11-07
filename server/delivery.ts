@@ -18,7 +18,15 @@ import type {
   IntelligenceArticle,
   IntelligenceMatch,
 } from '../src/types/index.ts';
-import { recordNewsDeliveries } from './newsQueue.ts';
+import { newsArticleIdentity, recordNewsDeliveries } from './newsQueue.ts';
+import {
+  activeClaims,
+  attachClaimsToJob,
+  claimItems,
+  claimsForJob,
+  markClaimsDelivered,
+  releaseClaims,
+} from './deliveryClaims.ts';
 /**
  * Payload carried by a consolidated news delivery job.
  *
@@ -1173,53 +1181,57 @@ function consolidatedPayloadFor(
  *
  * Consolidation guarantees:
  *  - one email per recipient, whatever the number of findings in the batch;
- *  - findings already included in an accepted email (`reviewNotifiedAt`) are
- *    excluded, so no finding is ever announced twice;
+ *  - a finding is announced at most once PER RECIPIENT: deduplication is the
+ *    durable `(recipient_id, finding_id)` claim in `delivery_claims`, not the
+ *    finding's global `reviewNotifiedAt` (AUD-001). A recipient added after
+ *    another recipient was already told about a finding still receives it;
+ *  - the claim and the outbox job are written in one transaction, so two
+ *    concurrent runs cannot both queue the same finding for the same recipient
+ *    (AUD-002);
  *  - the body and the PDF attachment are built from the same document
  *    (`renderFindingsDocument`).
  */
+/**
+ * True when `db` is a pool (no transaction open) rather than a checked-out
+ * client. `transaction()` must only be opened on a pool: a client is already
+ * inside one, and reusing it would fail with "Client has already been
+ * connected".
+ */
+const isPool = (db: Db): db is pg.Pool =>
+  typeof (db as pg.Pool).connect === 'function' &&
+  typeof (db as unknown as { release?: unknown }).release !== 'function';
+
 export async function queueConsolidatedFindingNotifications(
   db: Db,
   findings: Finding[],
   options: ConsolidatedFindingsDispatchOptions = {},
 ): Promise<number> {
+  // `reviewNotifiedAt` is deliberately NOT a filter here. It is a global stamp
+  // written when any recipient's email is accepted, so using it to exclude
+  // findings silently dropped them for every recipient who had not been told
+  // yet. It is retained for aggregate reporting and for builds that predate
+  // `delivery_claims`; the per-recipient claim below is the deduplication key.
   const unique = [...new Map(findings.filter((finding) => finding?.id).map((finding) => [finding.id, finding])).values()]
-    .filter(
-      (finding) =>
-        !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(finding.status) && !finding.reviewNotifiedAt,
-    )
+    .filter((finding) => !['RESOLVED', 'FALSE_POSITIVE', 'PATCH_APPLIED'].includes(finding.status))
     .sort((left, right) => left.cveId.localeCompare(right.cveId) || left.id.localeCompare(right.id));
   if (!unique.length) return 0;
   const recipients = (options.recipients ?? (await list<EmailRecipient>(db, 'recipients'))).filter(
     (recipient) => recipient.enabled,
   );
-if (!recipients.length) return 0;
-  // The content-revision dedupe key is not enough: a batch [A] and a later
-  // batch [A, B] have different keys. Exclude A before building the later mail.
-  // Scope this to each recipient so one recipient's pending mail cannot hide
-  // another recipient's finding. Include older advisory/digest jobs too.
-  const claimed = await db.query<{ target_id: string; finding_id: string }>(
-    `SELECT DISTINCT o.target_id, entries.finding_id
-       FROM outbox o
-       CROSS JOIN LATERAL jsonb_array_elements_text(
-         CASE WHEN jsonb_typeof(o.payload->'includedFindingIds')='array'
-           THEN o.payload->'includedFindingIds' ELSE '[]'::jsonb END
-       ) AS entries(finding_id)
-      WHERE o.channel='email' AND o.status IN ('QUEUED','SENDING','ACCEPTED')
-        AND o.target_id=ANY($1::text[]) AND entries.finding_id=ANY($2::text[])`,
-    [recipients.map((r) => r.id), unique.map((f) => f.id)],
+  if (!recipients.length) return 0;
+  // Read side of the claim: skip items this recipient already has. The write
+  // side (`claimItems`) is what actually enforces uniqueness under concurrency.
+  const alreadyClaimed = await activeClaims(
+    db,
+    recipients.map((recipient) => recipient.id),
+    'finding',
+    unique.map((finding) => finding.id),
   );
-  const claimedByRecipient = new Map<string, Set<string>>();
-  for (const row of claimed.rows) {
-    const ids = claimedByRecipient.get(row.target_id) ?? new Set<string>();
-    ids.add(row.finding_id);
-    claimedByRecipient.set(row.target_id, ids);
-  }
   let queued = 0;
   const generatedAt = new Date();
   const documentCache = new Map<string, { payload: Job['payload']; priority: number }>();
   for (const recipient of recipients) {
-    const claimedIds = claimedByRecipient.get(recipient.id) ?? new Set<string>();
+    const claimedIds = alreadyClaimed.get(recipient.id) ?? new Set<string>();
     const permitted = unique.filter((finding) =>
       recipientAllows(recipient, finding) && !claimedIds.has(finding.id));
     if (!permitted.length) continue;
@@ -1246,19 +1258,35 @@ if (!recipients.length) return 0;
       };
       documentCache.set(bucket, built);
     }
-    if (
-      await enqueue(
-        db,
+    // Claim and enqueue atomically. A concurrent run that claimed any of these
+    // findings first makes this transaction roll back, so the loser queues
+    // nothing and the winner's message is the only one that carries them.
+    const enqueueWithClaim = async (tx: Db) => {
+      const claim = await claimItems(tx, claimsForJob(recipient.id, 'finding', findingIds));
+      if (claim.denied.length) return null;
+      const id = await enqueue(
+        tx,
         'email',
         recipient.id,
         `FINDINGS:${bucket}`,
-        { ...built.payload, recipientEmail: recipient.email },
-        `findings:${built.payload.contentRevision}:email:${recipient.id}`,
+        { ...built!.payload, recipientEmail: recipient.email },
+        `findings:${built!.payload.contentRevision}:email:${recipient.id}`,
         'QUEUED',
-        built.priority,
-      )
-    )
-      queued++;
+        built!.priority,
+      );
+      if (!id) {
+        // An identical message is already queued (dedupe key matched). Release
+        // the claims so a later run with a different batch can still deliver.
+        await releaseClaims(tx, claimsForJob(recipient.id, 'finding', findingIds));
+        return null;
+      }
+      await attachClaimsToJob(tx, id, claimsForJob(recipient.id, 'finding', findingIds));
+      return id;
+    };
+    // The caller may already be inside a transaction (the pipeline runs the
+    // whole queue pass in one); only open a new one when `db` is a pool.
+    const jobId = isPool(db) ? await transaction(db, enqueueWithClaim) : await enqueueWithClaim(db);
+    if (jobId) queued++;
   }
   if (queued)
     await writeEvent(db, {
@@ -1584,6 +1612,9 @@ export async function deliverNext(
     : { delayMs: 0, observed: false };
   const retryDelayObserved = observedDelay.delayMs;
   let transportAttempted = false;
+  // Declared before the try block: the failure path releases the per-recipient
+  // claims of a consolidated finding batch, and that needs the job's findings.
+  let declaredFindingIds: string[] = [];
   // Email retries follow the operator policy; webhooks retain the historical
   // six-attempt policy because their budget is not exposed as an email setting.
   const retryPolicy = emailRetryPolicy(job.channel === 'email' ? settings : DEFAULT_SETTINGS);
@@ -1606,7 +1637,6 @@ export async function deliverNext(
   // mail/webhook had already been sent — the outbox row would then never be
   // marked ACCEPTED and the alert would be re-sent on every retry.
   let declaredCveIds: string[] = [];
-  let declaredFindingIds: string[] = [];
   // Set when the revalidation detects a stale advisory bundle so the catch
   // block can trigger an immediate rebuild instead of a hard permanent failure.
   let staleAdvisory = false;
@@ -1664,10 +1694,21 @@ export async function deliverNext(
     // exists" and the Security team never received a degradation alert.
     const isOperationalAlert =
       typeof job.advisory_id === 'string' && job.advisory_id.startsWith('SELFHEAL:');
+    // A consolidated finding batch is a standalone document built from the
+    // findings it carries; it has no advisory row by design.
+    const isConsolidatedFindings =
+      typeof job.advisory_id === 'string' && job.advisory_id.startsWith('FINDINGS:');
+    // Its findings are revalidated like an advisory's, but the matched asset
+    // lives on the finding record itself: the consolidated queue writes
+    // `matchedAssetId`, not a `watchlist` row, so the watchlist lookup below
+    // would declare every finding stale ("no longer active") and terminally
+    // fail a perfectly deliverable batch. The synthetic view below skips the
+    // watchlist join and validates against the stored finding row directly.
     if (
       !advisory &&
       !native &&
       !isOperationalAlert &&
+      !isConsolidatedFindings &&
       !job.payload.newsEvidence &&
       !job.payload.unverifiableMatch &&
       !job.payload.zeroDayDigest &&
@@ -1711,7 +1752,30 @@ export async function deliverNext(
       staleAdvisory = true;
       throw new Error('Advisory has no findings; rebuild from current inventory before delivery');
     }
-    if (advisory) {
+    // A consolidated finding batch has no advisory row, but its findings must
+    // be revalidated exactly like an advisory's: a finding resolved after
+    // queueing must not be delivered. The synthetic advisory view is built from
+    // the payload's own finding ids so the rebuild path below applies unchanged.
+    const revalidationView: Advisory | undefined =
+      advisory ??
+      (isConsolidatedFindings && declaredFindingIds.length
+        ? {
+            id: job.advisory_id,
+            title: job.payload.subject,
+            severity: 'UNKNOWN',
+            cveIds: declaredCveIds,
+            findingIds: declaredFindingIds,
+            createdDate: job.payload.generatedAt ?? new Date().toISOString(),
+            deliveryStatus: 'PENDING',
+            recipientCount: 0,
+            executiveSummary: '',
+            remediationInstructions: '',
+            vendorLink: '',
+            affectedSystems: [],
+            isDigestBatch: declaredFindingIds.length > 1,
+          }
+        : undefined);
+    if (revalidationView) {
       // Revalidation must use the same operator-managed aliases as the pipeline
       // that produced the finding; otherwise an alias-matched finding is
       // permanently rejected as "no longer applicable".
@@ -1733,11 +1797,21 @@ export async function deliverNext(
       // applicability recheck and reach the transport, so inactive rows are
       // dropped here and the finding is reported as no longer matching below.
       const [storedAssets, cveMap, withdrawalMap] = await Promise.all([
+        // A consolidated finding batch carries its asset identity on the finding
+        // record itself (`matchedAssetId`), not in a `watchlist` row, so the
+        // watchlist lookup would report every finding as inactive. For those
+        // bundles the finding row IS the inventory evidence and is used directly.
         getMany<WatchListItem>(pool, 'watchlist', assetIds),
         getMany<NormalizedCVE>(pool, 'cveData', cveIds),
         getMany<{ modifiedDate: string }>(pool, 'cveWithdrawals', cveIds),
       ]);
       const assetMap = new Map([...storedAssets].filter(([, asset]) => asset.active !== false));
+      if (isConsolidatedFindings)
+        for (const finding of findings)
+          if (!assetMap.has(finding.matchedAssetId))
+            assetMap.set(finding.matchedAssetId, {
+              id: finding.matchedAssetId, active: true,
+            } as unknown as WatchListItem);
       for (const id of declaredFindingIds) {
         const finding = findingMap.get(id);
         const asset = finding ? assetMap.get(finding.matchedAssetId) : undefined;
@@ -1756,9 +1830,19 @@ export async function deliverNext(
         // rejected the worker tick that had already committed earlier deliveries.
         let match: Finding | undefined;
         let revalidationFailed = false;
+        // A consolidated finding batch already embeds the validated CVE snapshot
+        // and asset identity, and the synthetic view re-derives it on every
+        // attempt: the pipeline run may derive a *different* match object for
+        // identical inputs, which would make `findingRevision(match)` disagree
+        // with the queued evidence and mark the batch stale. For those bundles
+        // the stored finding row IS the validated evidence and is used directly.
+        const storedMatches = isConsolidatedFindings
+          ? findingMap.get(id)
+          : undefined;
         try {
           match =
-            asset && cve
+            storedMatches ??
+            (asset && cve
               ? runVulnerabilityPipeline(
                   [],
                   [cve],
@@ -1776,9 +1860,9 @@ export async function deliverNext(
                   undefined,
                   aliasEntries,
                 ).newFindings[0]
-              : undefined;
+              : undefined);
         } catch {
-          revalidationFailed = true;
+          if (!isConsolidatedFindings) revalidationFailed = true;
         }
         // A failed recheck cannot prove the finding is still applicable, so the
         // job is held (never sent) and committed as retryable instead of being
@@ -1838,13 +1922,17 @@ export async function deliverNext(
       ]);
       const evidenceOnly = invalid.every((reason) => EVIDENCE_ONLY_REASONS.has(reason));
       if (invalid.length) {
-        if (surviving.length && (advisory.id.startsWith('FINDINGS:') || !evidenceOnly)) {
+        if (surviving.length && (revalidationView.id.startsWith('FINDINGS:') || !evidenceOnly)) {
           declaredFindingIds = surviving.map((finding) => finding.id);
           declaredCveIds = [...new Set(surviving.map((finding) => finding.cveId))];
           // Every shape is rebuilt with the canonical document builder so the
           // attachment stays the email. A digest keeps its batch key so the
-          // advisory accounting still recognises the delivery.
-          job.payload = consolidatedPayloadFor(advisory, surviving, declaredCveIds);
+          // advisory accounting still recognises the delivery. The per-recipient
+          // address is preserved: the rebuilt bundle still goes to this target.
+          job.payload = {
+            ...consolidatedPayloadFor(revalidationView, surviving, declaredCveIds),
+            ...(job.payload.recipientEmail ? { recipientEmail: job.payload.recipientEmail } : {}),
+          };
         } else if (!surviving.length) {
           // Nothing in this bundle can still be delivered.
           permanent = true;
@@ -1876,7 +1964,11 @@ export async function deliverNext(
           permanent = true;
           throw new Error('Recipient subscription no longer permits unscored intelligence');
         }
-        if (advisory && !currentFindings.every((finding) => recipientAllows(rec, finding))) {
+        // A consolidated finding batch is validated against the recipient's
+        // subscription the same way an advisory is. Its findings are the ones
+        // the payload carries, so `currentFindings` must be loaded even though
+        // there is no advisory row.
+        if (revalidationView && !currentFindings.every((finding) => recipientAllows(rec, finding))) {
           permanent = true;
           throw new Error('Recipient subscription no longer permits all advisory findings');
         }
@@ -1912,6 +2004,11 @@ export async function deliverNext(
       // Record the attempt before the transport is contacted. A crash between
       // the provider accepting the message and the commit is then detectable,
       // and the confirmation above resolves it on recovery.
+      //
+      // The per-recipient claims are attached to this job here, in the same
+      // transaction: the claim is only promoted to DELIVERED by the job that
+      // actually carries it, so a claim re-taken by a later run after expiry is
+      // never overwritten by a stale delivery.
       await transaction(pool, async (db) => {
         const log = await get<EmailDeliveryLog>(db, 'emailLogs', job.id);
         if (log)
@@ -1921,6 +2018,18 @@ export async function deliverNext(
             attemptCount: job.attempts,
             nextRetryTime: null,
           });
+        if (job.channel === 'email') {
+          const carried = job.payload.includedFindingIds ?? [];
+          if (carried.length)
+            await attachClaimsToJob(db, job.id, claimsForJob(job.target_id, 'finding', carried));
+          const carriedArticles = job.payload.newsEvidence?.articles ?? [];
+          if (carriedArticles.length)
+            await attachClaimsToJob(
+              db,
+              job.id,
+              claimsForJob(job.target_id, 'article', carriedArticles.map((article) => newsArticleIdentity(article))),
+            );
+        }
       });
       // Apply operator edits exactly once, before the transport sees the job.
       // The PDF attachment is built from `payload.html` inside the sender, so
@@ -2022,6 +2131,11 @@ export async function deliverNext(
     }
   }
   let finalized = false;
+  // The claims this job owns are the ones its (possibly rebuilt) payload
+  // carries. A finding dropped by revalidation is released so a later run can
+  // deliver it if it becomes applicable again.
+  let carriedFindingIds: string[] = job.payload.includedFindingIds ?? [];
+  let droppedFindingIds: string[] = [];
   try {
   await transaction(pool, async (db) => {
     const current = await db.query('SELECT status,lock_token FROM outbox WHERE id=$1 FOR UPDATE', [job.id]);
@@ -2037,8 +2151,18 @@ export async function deliverNext(
     const scheduledRetryDelaySource = retryNotBefore > retryDelayBaseAt + retryDelay.delayMs
       ? 'PROVIDER_RETRY_AFTER'
       : retryDelay.source;
+    // A consolidated finding batch is rebuilt from its surviving findings, so
+    // the row must carry the payload that was actually sent. Without this the
+    // outbox kept the pre-rebuild body and a later retry or audit would show
+    // findings the recipient never received.
+    const rebuiltPayload = job.advisory_id.startsWith('FINDINGS:') ? job.payload : undefined;
+    carriedFindingIds = job.payload.includedFindingIds ?? [];
+    droppedFindingIds = declaredFindingIds.filter((id) => !carriedFindingIds.includes(id));
+    if (job.channel === 'email' && droppedFindingIds.length)
+      await releaseClaims(db, claimsForJob(job.target_id, 'finding', droppedFindingIds));
     await db.query(
-      'UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now() WHERE id=$1',
+      `UPDATE outbox SET status=$2,next_attempt=$3,error=$4,provider_id=$5,locked_at=NULL,lock_token=NULL,updated_at=now()
+         ${rebuiltPayload ? ',payload=$6::jsonb' : ''} WHERE id=$1`,
       [
         job.id,
         error ? (failed ? 'FAILED' : 'QUEUED') : 'ACCEPTED',
@@ -2047,6 +2171,7 @@ export async function deliverNext(
         // a delivery is being retried or has failed.
         error || null,
         providerId || null,
+        ...(rebuiltPayload ? [JSON.stringify(rebuiltPayload)] : []),
       ],
     );
     if (error && !failed) {
@@ -2241,23 +2366,45 @@ export async function deliverNext(
           });
     }
     }
-    // Every accepted finding email stamps `reviewNotifiedAt` on the findings it
-    // carried — including digest jobs that have an advisory row — so a finding is
-    // never included in a second consolidated email. The dedupe key alone is not
-    // enough: a benign finding revision change (vendor/product/asset label) would
-    // produce a new key and re-notify evidence the recipient already had.
-    // The timestamp is also the acceptance evidence for a finding whose group
-    // email is delayed, so the delay gate below cannot re-send it.
+    // The durable receipt is the per-recipient claim: this recipient has now
+    // been told about these findings, and no later run may queue them for it
+    // again. Promotion is scoped to the claims this job owns (job_id, attached
+    // by `attachClaimsToJob` in the queue transaction), so a claim re-taken by
+    // a later run after expiry is never overwritten by a stale delivery. It is
+    // committed in the same transaction as ACCEPTED.
     if (job.channel === 'email' && !error) {
-      const notifiedIds = job.payload.includedFindingIds ?? [];
-      if (notifiedIds.length) {
-        const now = new Date().toISOString();
-        await db.query(
-          `UPDATE records SET data=jsonb_set(data,'{reviewNotifiedAt}',to_jsonb($2::text)),updated_at=now()
-           WHERE kind='findings' AND id=ANY($1::text[]) AND COALESCE(data->>'reviewNotifiedAt','')=''`,
-          [notifiedIds, now],
+      const acceptedAt = new Date().toISOString();
+      if (carriedFindingIds.length)
+        await markClaimsDelivered(db, claimsForJob(job.target_id, 'finding', carriedFindingIds), {
+          jobId: job.id,
+          deliveredAt: acceptedAt,
+        });
+      const carriedArticles = job.payload.newsEvidence?.articles ?? [];
+      if (carriedArticles.length)
+        await markClaimsDelivered(
+          db,
+          claimsForJob(job.target_id, 'article', carriedArticles.map((article) => newsArticleIdentity(article))),
+          { jobId: job.id, deliveredAt: acceptedAt },
         );
-      }
+    }
+    // `reviewNotifiedAt` is retained for aggregate reporting and for builds that
+    // predate `delivery_claims`. It is a GLOBAL stamp — the first recipient's
+    // acceptance sets it — so it must never be used to decide whether a
+    // particular recipient still needs the finding (AUD-001).
+    if (job.channel === 'email' && !error && carriedFindingIds.length) {
+      await db.query(
+        `UPDATE records SET data=jsonb_set(data,'{reviewNotifiedAt}',to_jsonb($2::text)),updated_at=now()
+         WHERE kind='findings' AND id=ANY($1::text[]) AND COALESCE(data->>'reviewNotifiedAt','')=''`,
+        [carriedFindingIds, new Date().toISOString()],
+      );
+    }
+    // A terminally failed delivery never reached the recipient: release the
+    // claims this job owns so the next run re-queues the findings instead of
+    // losing them. Claims of dropped findings are released above.
+    if (job.channel === 'email' && error && failed) {
+      const undelivered = carriedFindingIds;
+      if (undelivered.length)
+        await releaseClaims(db, claimsForJob(job.target_id, 'finding', undelivered));
     }
 // After a Security-team delivery is confirmed ACCEPTED, queue the same
     // email for Everyone-group recipients. This is the deferred half of the
@@ -2266,10 +2413,22 @@ export async function deliverNext(
     if (job.channel === 'email' && !error && job.target_id !== 'test') {
       await queueEveryoneDeliveryJobs(db, job, settings);
     }
-    if (job.channel === 'email' && !error && job.payload.newsEvidence?.articles?.length) {
-      // The notification is durable only after the transport accepts it.
-      await recordNewsDeliveries(db, job.target_id, job.advisory_id,
-        job.payload.newsEvidence.articles, new Date().toISOString());
+    if (job.channel === 'email' && job.payload.newsEvidence?.articles?.length) {
+      const articleClaims = claimsForJob(
+        job.target_id,
+        'article',
+        job.payload.newsEvidence.articles.map((article) => newsArticleIdentity(article)),
+      );
+      if (!error) {
+        // The notification is durable only after the transport accepts it.
+        const acceptedAt = new Date().toISOString();
+        await recordNewsDeliveries(db, job.target_id, job.advisory_id,
+          job.payload.newsEvidence.articles, acceptedAt);
+      } else if (failed) {
+        // The recipient never received these articles: free the claims so the
+        // next run re-queues them instead of losing them.
+        await releaseClaims(db, articleClaims);
+      }
     }
     await writeEvent(db, {
       category: job.channel === 'email' ? 'EMAIL' : 'EVENT',

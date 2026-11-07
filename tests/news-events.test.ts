@@ -24,6 +24,8 @@ import type {
   EmailRecipient,
 } from '../src/types/index.ts';
 import { deliverNext } from '../server/delivery';
+import { alreadyNotified, queueConsolidatedNews, recordNewsDeliveries } from '../server/newsQueue.ts';
+import { newsArticleIdentity, newsNotifiedKey } from '../server/newsEmail.ts';
 const now = new Date('2026-10-21T12:00:00Z');
 const rss = (items: string) => `<rss version="2.0"><channel><title>Security</title>${items}</channel></rss>`;
 const item = (
@@ -950,3 +952,185 @@ test('securitymetrics does not degrade into the word security', () => {
     'a generic-word article must not become vendor evidence',
   );
 });
+
+test(
+  'alreadyNotified reads the ledger and the outbox against a real database',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    // AUD-005: the previous coverage built the notification set by hand. This
+    // executes the SQL in `alreadyNotified` — both the ledger query and the
+    // outbox `newsEvidence` query — against PostgreSQL.
+    const base = createPool(process.env.TEST_DATABASE_URL!);
+    const schema = 'news_notified_' + randomUUID().replaceAll('-', '');
+    await base.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = createPool(url.href);
+    try {
+      await migrate(pool);
+      const ledgerArticle = { id: 'a-ledger', url: 'https://example.com/ledger-story' };
+      const queuedArticle = { id: 'a-queued', url: 'https://example.com/queued-story' };
+      const acceptedArticle = { id: 'a-accepted', url: 'https://example.com/accepted-story' };
+      const freshArticle = { id: 'a-fresh', url: 'https://example.com/fresh-story' };
+
+      // Ledger receipt for r1 only.
+      await recordNewsDeliveries(pool, 'r1', 'NEWS:ledger', [ledgerArticle]);
+      // A queued job for r2 carrying one article.
+      await pool.query(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'news-queued','email','r2','NEWS:queued',$1::jsonb,'QUEUED')`,
+        [JSON.stringify({ newsEvidence: { articles: [queuedArticle] } })],
+      );
+      // An accepted job for r3 carrying another article.
+      await pool.query(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'news-accepted','email','r3','NEWS:accepted',$1::jsonb,'ACCEPTED')`,
+        [JSON.stringify({ newsEvidence: { articles: [acceptedArticle] } })],
+      );
+      // A failed job must not count as notified.
+      await pool.query(
+        `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+         VALUES(gen_random_uuid(),'news-failed','email','r4','NEWS:failed',$1::jsonb,'FAILED')`,
+        [JSON.stringify({ newsEvidence: { articles: [acceptedArticle] } })],
+      );
+
+      const articles = new Map(
+        [ledgerArticle, queuedArticle, acceptedArticle, freshArticle].map((article) => [article.id, article]),
+      );
+      const notified = await alreadyNotified(pool, ['r1', 'r2', 'r3', 'r4'], articles);
+      const has = (recipientId: string, article: { id: string; url: string }) =>
+        notified.get(recipientId)!.has(newsNotifiedKey(recipientId, article.id)) ||
+        notified.get(recipientId)!.has(newsNotifiedKey(recipientId, newsArticleIdentity(article)));
+
+      assert.equal(has('r1', ledgerArticle), true, 'the ledger receipt is read');
+      assert.equal(has('r1', freshArticle), false);
+      assert.equal(has('r2', queuedArticle), true, 'a queued job counts as notified');
+      assert.equal(has('r3', acceptedArticle), true, 'an accepted job counts as notified');
+      assert.equal(has('r4', acceptedArticle), false, 'a failed job does not count as notified');
+      assert.equal(has('r2', ledgerArticle), false, 'the ledger is per recipient');
+    } finally {
+      await pool.end();
+      await base.query(`DROP SCHEMA ${schema} CASCADE`);
+      await base.end();
+    }
+  },
+);
+
+test(
+  'consolidated news claims each article per recipient and never queues it twice',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    // AUD-002 / AUD-005: the claim is written in the enqueue transaction, so a
+    // second run — including a concurrent one — cannot queue the same article
+    // for the same recipient.
+    const base = createPool(process.env.TEST_DATABASE_URL!);
+    const schema = 'news_claims_' + randomUUID().replaceAll('-', '');
+    await base.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = createPool(url.href);
+    try {
+      await migrate(pool);
+      const recipient: EmailRecipient = {
+        id: 'sec-team',
+        name: 'Security Team',
+        email: 'sec@example.invalid',
+        role: 'ADMIN',
+        deliveryGroup: 'SECURITY_TEAM',
+        subscriptionTier: 'ALL_SEVERITIES',
+        enabled: true,
+        deliverySuccessRate: 100,
+      };
+      const article: IntelligenceArticle = {
+        id: 'a1',
+        url: 'https://example.com/story-1',
+        title: 'Story one',
+        summary: '',
+        publishedDate: '2026-01-01T00:00:00Z',
+        modifiedDate: '2026-01-01T00:00:00Z',
+        cveIds: ['CVE-2026-12345'],
+        sourceFeeds: ['THREAT_FEED'],
+      };
+      const matches = [
+        {
+          id: 'm1',
+          cveId: 'CVE-2026-12345',
+          assetId: 'asset-1',
+          assetName: 'server-1',
+          articleIds: ['a1'],
+          status: 'REVIEW_REQUIRED',
+          evidence: 'Acme widget referenced',
+          credibilityScore: 80,
+        },
+      ] as unknown as Parameters<typeof queueConsolidatedNews>[1];
+      const enqueue = async (input: Parameters<NonNullable<Parameters<typeof queueConsolidatedNews>[4]['enqueue']>>[0]) => {
+        const id = randomUUID();
+        await input.db.query(
+          `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status)
+           VALUES($1,$2,'email',$3,$4,$5::jsonb,'QUEUED')`,
+          [
+            id,
+            `${input.identity}:email:${input.recipient.id}`,
+            input.recipient.id,
+            input.advisoryId,
+            JSON.stringify({
+              subject: input.subject,
+              text: input.text,
+              html: input.html,
+              cveIds: input.cveIds,
+              newsEvidence: {
+                articles: input.articles.map((item) => ({ id: item.article.id, url: item.article.url })),
+              },
+            }),
+          ],
+        );
+        return id;
+      };
+
+      const first = await queueConsolidatedNews(
+        pool,
+        matches,
+        new Map([[article.id, article]]),
+        [recipient],
+        { enqueue },
+      );
+      assert.equal(first.emailsQueued, 1);
+      const claims = await pool.query<{ kind: string; item_id: string; state: string }>(
+        'SELECT kind,item_id,state FROM delivery_claims',
+      );
+      assert.deepEqual(claims.rows, [
+        { kind: 'article', item_id: newsArticleIdentity(article), state: 'CLAIMED' },
+      ]);
+
+      // A second run sees the claim and queues nothing.
+      const second = await queueConsolidatedNews(
+        pool,
+        matches,
+        new Map([[article.id, article]]),
+        [recipient],
+        { enqueue },
+      );
+      assert.equal(second.emailsQueued, 0);
+      assert.equal(
+        (await pool.query('SELECT count(*)::int AS n FROM outbox')).rows[0].n,
+        1,
+        'the article is queued exactly once',
+      );
+
+      // A recipient added later still receives it: the claim is per recipient.
+      const newcomer: EmailRecipient = { ...recipient, id: 'sec-team-2', email: 'sec2@example.invalid' };
+      const third = await queueConsolidatedNews(
+        pool,
+        matches,
+        new Map([[article.id, article]]),
+        [newcomer],
+        { enqueue },
+      );
+      assert.equal(third.emailsQueued, 1);
+    } finally {
+      await pool.end();
+      await base.query(`DROP SCHEMA ${schema} CASCADE`);
+      await base.end();
+    }
+  },
+);

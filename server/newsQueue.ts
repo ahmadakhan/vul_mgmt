@@ -1,22 +1,33 @@
 import { createHash } from 'node:crypto';
+import type pg from 'pg';
 import type {
   EmailRecipient,
   IntelligenceArticle,
   IntelligenceMatch,
 } from '../src/types/index.ts';
 import type { Db } from './db.ts';
-import { get, list, put } from './db.ts';
+import { get, list, put, transaction } from './db.ts';
 import { writeEvent } from './events.ts';
 import { stableJson } from '../src/utils/deduplicator.ts';
 import {
   consolidateNewsMatches,
   newsArticleIdentity,
   newsNotifiedKey,
-  renderConsolidatedNewsEmail,
+  renderConsolidatedNewsEmailWithin,
   selectUnnotifiedArticles,
   type ConsolidatedNewsItem,
 } from './newsEmail.ts';
-import { deliveryHtmlIsAttachable } from './deliveryDocument.ts';
+import { activeClaims, attachClaimsToJob, claimItems, claimsForJob, releaseClaims } from './deliveryClaims.ts';
+
+/**
+ * True when `db` is a pool (no transaction open) rather than a checked-out
+ * client. `transaction()` must only be opened on a pool: a client is already
+ * inside one, and reusing it would fail with "Client has already been
+ * connected".
+ */
+const isPool = (db: Db): db is pg.Pool =>
+  typeof (db as pg.Pool).connect === 'function' &&
+  typeof (db as unknown as { release?: unknown }).release !== 'function';
 
 /**
  * Per-article news delivery ledger.
@@ -92,7 +103,7 @@ export interface NewsQueueDeps {
  * survives outbox retention, and the outbox catches emails queued before the
  * ledger existed (or by a build that predates it).
  */
-async function alreadyNotified(
+export async function alreadyNotified(
   db: Db,
   recipientIds: readonly string[],
   articles: ReadonlyMap<string, Pick<IntelligenceArticle, 'id' | 'url'>>,
@@ -203,45 +214,87 @@ export async function queueConsolidatedNews(
   );
   if (!items.length) return result;
   const articleRecord = new Map(items.map((item) => [item.article.id, item.article] as const));
-  const notified = await alreadyNotified(db, selected.map((recipient) => recipient.id), articleRecord);
+  const recipientIds = selected.map((recipient) => recipient.id);
+  const notified = await alreadyNotified(db, recipientIds, articleRecord);
+  // Durable per-recipient claims (AUD-002). `alreadyNotified` is the read side;
+  // the claim written in the enqueue transaction is what makes two concurrent
+  // runs unable to queue the same article for the same recipient.
+  const claimed = await activeClaims(
+    db,
+    recipientIds,
+    'article',
+    items.map((item) => newsArticleIdentity(item.article)),
+  );
   // A recipient receives one consolidated news email per pipeline run.
   for (const recipient of selected) {
-    const own = selectUnnotifiedArticles(items, recipient.id, notified.get(recipient.id) || new Set());
+    const own = selectUnnotifiedArticles(items, recipient.id, notified.get(recipient.id) || new Set()).filter(
+      (item) => !claimed.get(recipient.id)?.has(newsArticleIdentity(item.article)),
+    );
     if (!own.length) {
       result.articlesSuppressed += items.length;
       continue;
     }
     // One consolidated message per recipient, not one message per 100 articles.
-    const batch = own;
-    const overflow: typeof own = [];
-    const document = renderConsolidatedNewsEmail(batch);
-    const cveIds = [...new Set(batch.flatMap((item) => item.cveIds))].sort();
-    const articleIds = batch.map((item) => item.article.id).sort();
+    // The renderer keeps the styled HTML within an explicit size budget and
+    // lists any article that does not fit in a styled overflow summary, so the
+    // body is never replaced by the plain-text document (AUD-004).
+    const document = renderConsolidatedNewsEmailWithin(own);
+    const batch = own.filter((item) => !document.overflow.includes(item));
+    const overflow = document.overflow;
+    const cveIds = [...new Set(own.flatMap((item) => item.cveIds))].sort();
+    const articleIds = own.map((item) => item.article.id).sort();
     const contentRevision = createHash('sha256')
-      .update(stableJson({ recipientId: recipient.id, articleIds, articleIdentities: batch.map((item) => newsArticleIdentity(item.article)).sort() }))
+      .update(stableJson({ recipientId: recipient.id, articleIds, articleIdentities: own.map((item) => newsArticleIdentity(item.article)).sort() }))
       .digest('hex')
       .slice(0, 20);
     const advisoryId = `NEWS:${articleIds.join(',')}`.slice(0, 512);
-    const queuedId = await deps.enqueue({
-      db,
-      recipient,
-      articles: batch,
-      subject: document.subject,
-      text: document.text,
-      html: deliveryHtmlIsAttachable(document.html) ? document.html : document.text,
-      cveIds,
-      contentRevision,
-      identity: `news:${recipient.id}:${articleSetFingerprint(articleIds)}`,
-      advisoryId,
-    });
+    const identity = `news:${recipient.id}:${articleSetFingerprint(articleIds)}`;
+    const claimRequests = claimsForJob(
+      recipient.id,
+      'article',
+      own.map((item) => newsArticleIdentity(item.article)),
+    );
+    // Claim and enqueue atomically: a concurrent run that claimed any of these
+    // articles first makes this transaction roll back, so only one run queues
+    // the message. The claim is released if the enqueue dedupes.
+    //
+    // The caller may already be inside a transaction (the pipeline runs the
+    // whole queue pass in one), in which case `db` is a client and the claim and
+    // the enqueue share that transaction. Otherwise a transaction is opened here.
+    const enqueueWithClaim = async (tx: Db) => {
+      const claim = await claimItems(tx, claimRequests);
+      if (claim.denied.length) return null;
+      const id = await deps.enqueue({
+        db: tx,
+        recipient,
+        articles: own,
+        subject: document.subject,
+        text: document.text,
+        // The HTML is always the styled document; the size budget guarantees it
+        // is attachable, and the plain text is only ever the alternative part.
+        html: document.html,
+        cveIds,
+        contentRevision,
+        identity,
+        advisoryId,
+      });
+      if (!id) {
+        await releaseClaims(tx, claimRequests);
+        return null;
+      }
+      await attachClaimsToJob(tx, id, claimRequests);
+      return id;
+    };
+    const queuedId = isPool(db) ? await transaction(db, enqueueWithClaim) : await enqueueWithClaim(db);
     if (!queuedId) {
-      // An identical message is already queued (dedupe key matched). Treat it
-      // as already told so the next run does not retry the same content.
-      result.articlesSuppressed += batch.length;
+      // An identical message is already queued (dedupe key matched) or another
+      // run claimed these articles first. Treat them as already told so the
+      // next run does not retry the same content.
+      result.articlesSuppressed += own.length;
       continue;
     }
     result.emailsQueued++;
-    result.articlesIncluded += batch.length;
+    result.articlesIncluded += own.length;
     result.articlesSuppressed += overflow.length;
     // Do not mark news delivered on enqueue. The delivery worker records a
     // durable receipt only after the mail provider accepts the message.
@@ -252,8 +305,10 @@ export async function queueConsolidatedNews(
       message: 'Consolidated security-news email queued for the Security team',
       context: {
         recipientId: recipient.id,
-        articles: batch.length,
-        matches: [...new Set(batch.flatMap((item) => item.matchIds))].length,
+        articles: own.length,
+        fullCards: batch.length,
+        overflowSummary: overflow.length,
+        matches: [...new Set(own.flatMap((item) => item.matchIds))].length,
         advisoryId,
         suppressAlreadySent: own.length - batch.length,
       },

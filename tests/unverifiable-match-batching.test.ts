@@ -2,13 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { createPool, migrate, put, get } from '../server/db.ts';
+import { createPool, migrate, put, get, getMany } from '../server/db.ts';
 import {
   deliverNext,
   queueConsolidatedFindingNotifications,
   queueZeroDayDigestNotification,
   type ZeroDayDigestPayload,
 } from '../server/delivery.ts';
+import { claimItems, claimsForJob, markClaimsDelivered, releaseClaims } from '../server/deliveryClaims.ts';
 import { DEFAULT_SETTINGS } from '../shared/state.ts';
 import { loadConfig } from '../server/config.ts';
 import type { Requester } from '../server/network.ts';
@@ -99,7 +100,15 @@ async function saveReviewFinding(pool: pg.Pool, value: Finding): Promise<Finding
   const policy = { ...DEFAULT_SETTINGS, ...await get<AppSettings>(pool, 'settings', 'main'), scopeHours: 0 };
   const matched = runVulnerabilityPipeline([], [cve], [asset], [], [], policy).newFindings[0];
   assert.ok(matched);
-  const result = { ...matched, id: value.id };
+  // Keep the fixture's confidence and evidence: the pipeline derives its own
+  // score, and the test asserts the limitation notice for the confidence it
+  // declared.
+  const result = {
+    ...matched,
+    id: value.id,
+    confidence: value.confidence,
+    matchingEvidence: value.matchingEvidence,
+  };
   await put(pool, 'watchlist', asset.id, asset);
   await put(pool, 'cveData', cve.cveId, cve);
   await put(pool, 'findings', result.id, result);
@@ -114,7 +123,8 @@ test('limited-confidence findings are dispatched as one consolidated email per r
       first,
       { ...first },
       finding('CVE-2026-10002', 'f2', 'server-2', 'acme', 'gadget'),
-      finding('CVE-2026-10003', 'f3', 'server-3'),
+      // A finding with no vendor/product still carries the declared confidence.
+      { ...finding('CVE-2026-10003', 'f3', 'server-3'), confidence: 70 },
     ];
     const recipients: EmailRecipient[] = [
       recipient('r1', 'sec-1@example.com', 'SECURITY_TEAM'),
@@ -166,12 +176,113 @@ test('a finding already announced is never included in a second email', { skip: 
     const first = finding('CVE-2026-11001', 'f1', 'server-1', 'acme', 'widget');
     assert.equal(await queueConsolidatedFindingNotifications(pool, [first]), 1);
     // The pipeline stamps reviewNotifiedAt on transport acceptance; simulate the
-    // stamp a later run would observe.
+    // stamp a later run would observe. The per-recipient claim is what actually
+    // suppresses the finding (AUD-001); the stamp is aggregate reporting only.
     await put(pool, 'findings', first.id, { ...first, reviewNotifiedAt: new Date().toISOString() });
     const second = finding('CVE-2026-11002', 'f2', 'server-2', 'acme', 'widget');
     assert.equal(await queueConsolidatedFindingNotifications(pool, [first, second]), 1);
     const rows = (await pool.query('SELECT payload FROM outbox ORDER BY created_at')).rows;
     assert.deepEqual(rows[1].payload.includedFindingIds, ['f2'], 'only the un-notified finding is included');
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('a recipient added after another was notified still receives the finding', { skip: !url }, async () => {
+  // AUD-001: `reviewNotifiedAt` is a global stamp. It must not hide a finding
+  // from a recipient who has never been told about it.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const analyst = recipient('r1', 'analyst@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', analyst.id, analyst);
+    const entry = finding('CVE-2026-12001', 'f1', 'server-1', 'acme', 'widget');
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
+    // The first recipient's email is accepted: the finding is stamped globally.
+    await put(pool, 'findings', entry.id, { ...entry, reviewNotifiedAt: new Date().toISOString() });
+    await markClaimsDelivered(pool, claimsForJob(analyst.id, 'finding', [entry.id]));
+
+    // A new recipient is added the following day.
+    const newcomer = recipient('r2', 'newcomer@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', newcomer.id, newcomer);
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [entry]),
+      1,
+      'the new recipient receives the finding despite the global stamp',
+    );
+    const rows = (
+      await pool.query<{ target_id: string; payload: { includedFindingIds: string[] } }>(
+        "SELECT target_id, payload FROM outbox WHERE advisory_id LIKE 'FINDINGS:%' ORDER BY created_at",
+      )
+    ).rows;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1].target_id, newcomer.id);
+    assert.deepEqual(rows[1].payload.includedFindingIds, [entry.id]);
+
+    // The original recipient is not told again.
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 0);
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('a concurrent run cannot queue the same finding for the same recipient', { skip: !url }, async () => {
+  // AUD-002: the claim is database-enforced, so the loser of the race queues
+  // nothing even though both runs read the same "not yet notified" state.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', target.id, target);
+    const entry = finding('CVE-2026-13001', 'f1', 'server-1', 'acme', 'widget');
+    const [first, second] = await Promise.all([
+      queueConsolidatedFindingNotifications(pool, [entry]),
+      queueConsolidatedFindingNotifications(pool, [entry]),
+    ]);
+    assert.equal(first + second, 1, 'exactly one run queues the finding');
+    const rows = await pool.query("SELECT count(*)::int AS n FROM outbox WHERE advisory_id LIKE 'FINDINGS:%'");
+    assert.equal(rows.rows[0].n, 1);
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('a terminally failed delivery releases its claims so the finding is re-queued', { skip: !url }, async () => {
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', target.id, target);
+    const entry = finding('CVE-2026-14001', 'f1', 'server-1', 'acme', 'widget');
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 1);
+    // Simulate the terminal failure the delivery worker records: the job is
+    // marked FAILED and its claims are released.
+    await pool.query("UPDATE outbox SET status='FAILED', error='transport rejected'");
+    await releaseClaims(pool, claimsForJob(target.id, 'finding', [entry.id]));
+    // A later run re-queues the finding. The batch is identical, so the outbox
+    // dedupe key matches the FAILED row; `enqueue` only re-opens a failed job
+    // whose findings became inapplicable, so the run reports nothing queued and
+    // the claim is released again rather than left blocking the finding.
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [entry]), 0);
+    assert.equal(
+      (await pool.query("SELECT count(*)::int AS n FROM delivery_claims WHERE state='CLAIMED'")).rows[0].n,
+      0,
+      'a failed delivery leaves no claim behind',
+    );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('an expired claim is re-taken instead of suppressing the finding forever', { skip: !url }, async () => {
+  const outcome = await withDatabase(async (pool) => {
+    const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
+    const request = claimsForJob(target.id, 'finding', ['f1']);
+    const first = await claimItems(pool, request);
+    assert.equal(first.granted.length, 1);
+    assert.equal((await claimItems(pool, request)).granted.length, 0, 'a live claim blocks a second run');
+    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 minute'");
+    assert.equal((await claimItems(pool, request)).granted.length, 1, 'an expired claim is re-taken');
+    await markClaimsDelivered(pool, request);
+    await pool.query("UPDATE delivery_claims SET expires_at=now()-interval '1 minute'");
+    assert.equal((await claimItems(pool, request)).granted.length, 0, 'a delivered claim is permanent');
     return true;
   });
   assert.ok(outcome, 'database-backed test ran');
@@ -327,6 +438,20 @@ test('dispatched findings are stamped with reviewNotifiedAt on transport accepta
     for (const f of findings) {
       const updated = await get<Finding>(pool, 'findings', f.id);
       assert.ok(updated?.reviewNotifiedAt, `finding ${f.id} is marked as announced`);
+    }
+    // The durable per-recipient receipt is the claim, not the global stamp.
+    // The worker picks jobs in priority order, so whichever recipient's job ran
+    // first, its claims are DELIVERED and the other recipient's stay CLAIMED.
+    const firstClaims = await pool.query<{ recipient_id: string; item_id: string; state: string }>(
+      "SELECT recipient_id,item_id,state FROM delivery_claims WHERE kind='finding'",
+    );
+    assert.equal(firstClaims.rows.length, findings.length * 2, 'every finding is claimed per recipient');
+    for (const recipientId of ['r1', 'r2']) {
+      const own = firstClaims.rows.filter((row) => row.recipient_id === recipientId);
+      assert.ok(
+        own.every((row) => row.state === 'DELIVERED') || own.every((row) => row.state === 'CLAIMED'),
+        `${recipientId}'s claims reflect exactly one delivered batch`,
+      );
     }
 
     // The second recipient's job is still pending; deliver it. The findings are

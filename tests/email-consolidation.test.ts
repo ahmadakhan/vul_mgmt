@@ -6,6 +6,7 @@ import {
   newsArticleIdentity,
   newsNotifiedKey,
   renderConsolidatedNewsEmail,
+  renderConsolidatedNewsEmailWithin,
   selectUnnotifiedArticles,
 } from '../server/newsEmail.ts';
 import {
@@ -263,6 +264,57 @@ test('syndicated URLs with different article ids and query strings are one story
   const ledger = new Set([newsNotifiedKey('r1', newsArticleIdentity(a1))]);
   assert.equal(selectUnnotifiedArticles(items, 'r1', ledger).length, 0);
   assert.equal(selectUnnotifiedArticles(items, 'r2', ledger).length, 1);
+});
+
+test('meaningful query parameters distinguish articles; tracking parameters do not', () => {
+  // AUD-003: `?id=100` and `?id=200` are different stories.
+  const first = article('a1', 'https://example.com/article?id=100', 'Story 100');
+  const second = article('a2', 'https://example.com/article?id=200', 'Story 200');
+  assert.notEqual(newsArticleIdentity(first), newsArticleIdentity(second));
+  const items = consolidateNewsMatches(
+    [match('m1', 'asset-1', ['a1', 'a2'])],
+    new Map([[first.id, first], [second.id, second]]),
+    () => 'server-1',
+  );
+  assert.equal(items.length, 2, 'distinct query-identified articles are not collapsed');
+
+  // Tracking parameters are still ignored, in any order.
+  const tracked = article('a3', 'https://example.com/article?id=100&utm_source=x&fbclid=abc&gclid=def', 'Story 100');
+  assert.equal(newsArticleIdentity(tracked), newsArticleIdentity(first));
+  const reordered = article('a4', 'https://example.com/article?utm_campaign=y&id=100', 'Story 100');
+  assert.equal(newsArticleIdentity(reordered), newsArticleIdentity(first));
+  // A different meaningful parameter is a different article.
+  const other = article('a5', 'https://example.com/article?id=100&page=2', 'Story 100 page 2');
+  assert.notEqual(newsArticleIdentity(other), newsArticleIdentity(first));
+});
+
+test('an oversized consolidated news email keeps styled HTML and summarises the overflow', () => {
+  // AUD-004: the body must never be replaced by the plain-text document.
+  const items = consolidateNewsMatches(
+    [match('m1', 'asset-1', ['a1', 'a2', 'a3'])],
+    new Map([
+      ['a1', article('a1', 'https://example.com/1', 'First story')],
+      ['a2', article('a2', 'https://example.com/2', 'Second story')],
+      ['a3', article('a3', 'https://example.com/3', 'Third story')],
+    ]),
+    () => 'server-1',
+  );
+  const full = renderConsolidatedNewsEmail(items);
+  assert.equal(full.overflow.length, 0);
+  // A budget that fits the shell plus one card but not all three.
+  const oneCard = renderConsolidatedNewsEmail(items.slice(0, 1), items.slice(1));
+  const budget = Buffer.byteLength(oneCard.html, 'utf8');
+  const bounded = renderConsolidatedNewsEmailWithin(items, budget);
+  assert.ok(Buffer.byteLength(bounded.html, 'utf8') <= budget, 'the HTML stays within the budget');
+  assert.ok(bounded.overflow.length > 0, 'the articles that did not fit are reported');
+  assert.match(bounded.html, /<!doctype html>/i, 'the body is still an HTML document');
+  assert.match(bounded.html, /ADDITIONAL ARTICLES/, 'the overflow summary is rendered');
+  assert.match(bounded.html, /background:#fffbeb/, 'the summary keeps the styled palette');
+  assert.match(bounded.html, /ARTICLE 1 OF 3/, 'the full cards are still styled cards');
+  for (const item of bounded.overflow)
+    assert.ok(bounded.html.includes(item.article.title), `overflow article ${item.article.id} is still named`);
+  assert.match(bounded.text, /Third story/, 'the text alternative lists every article');
+  assert.equal(bounded.subject, full.subject, 'the subject describes the whole batch');
 });
 
 test('a previously queued legacy article URL suppresses a new syndication id', () => {
