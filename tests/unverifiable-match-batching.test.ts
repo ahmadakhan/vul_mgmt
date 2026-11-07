@@ -10,6 +10,7 @@ import {
   type ZeroDayDigestPayload,
 } from '../server/delivery.ts';
 import { claimItems, claimsForJob, markClaimsDelivered, releaseClaims, releaseUnattachedClaims } from '../server/deliveryClaims.ts';
+import { reconcileHistoricalNewsDeliveries } from '../server/newsQueue.ts';
 import { DEFAULT_SETTINGS } from '../shared/state.ts';
 import { loadConfig } from '../server/config.ts';
 import type { Requester } from '../server/network.ts';
@@ -787,6 +788,115 @@ test('releaseUnattachedClaims frees only claims with no owning job', { skip: !ur
       1,
       'the owned claim survives the unattached cleanup',
     );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('an UNKNOWN terminal failure keeps claims until the outcome is reconciled', { skip: !url }, async () => {
+  // Audit follow-up, High #1: a connection drop after the provider may have
+  // accepted the message is recorded as UNKNOWN. The finalize path must NOT
+  // release the per-recipient claims — the first email may still be sitting in
+  // the recipient's inbox, and a later batch carrying the same finding with a
+  // different dedupe key would otherwise email it again.
+  const outcome = await withDatabase(async (pool) => {
+    await put(pool, 'settings', 'main', { ...DEFAULT_SETTINGS });
+    const target = recipient('r1', 'sec@example.invalid', 'SECURITY_TEAM');
+    await put(pool, 'recipients', target.id, target);
+    const first = finding('CVE-2026-18001', 'f1', 'server-1', 'acme', 'widget');
+    const second = finding('CVE-2026-18002', 'f2', 'server-2', 'acme', 'widget');
+    await put(pool, 'findings', first.id, first);
+    await put(pool, 'findings', second.id, second);
+    // Email A carries f1 only.
+    assert.equal(await queueConsolidatedFindingNotifications(pool, [first]), 1);
+    // The provider may have accepted it; the outcome is ambiguous.
+    await pool.query("UPDATE outbox SET status='FAILED', delivery_outcome='UNKNOWN', error='connection reset during send'");
+    // A later run discovers f2. f1 and f2 have different dedupe keys, so the
+    // released claim would have allowed f1 to be emailed again with f2.
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [first, second]),
+      1,
+      'only the genuinely new finding is queued',
+    );
+    const rows = (
+      await pool.query<{ payload: { includedFindingIds: string[] } }>(
+        "SELECT payload FROM outbox WHERE advisory_id LIKE 'FINDINGS:%' ORDER BY created_at",
+      )
+    ).rows;
+    assert.deepEqual(
+      rows[1].payload.includedFindingIds,
+      [second.id],
+      'the UNKNOWN-outcome finding is not re-notified',
+    );
+    // Once the provider confirms non-delivery (outcome REJECTED, as the
+    // confirm-prior-delivery path records it), the claims are released and the
+    // finding becomes deliverable again.
+    const staleJob = (
+      await pool.query<{ id: string }>(
+        "SELECT id FROM outbox WHERE payload->'includedFindingIds' ? $1 AND delivery_outcome='UNKNOWN'",
+        [first.id],
+      )
+    ).rows[0].id;
+    await pool.query("UPDATE outbox SET status='FAILED', delivery_outcome='REJECTED' WHERE id=$1", [staleJob]);
+    await releaseClaims(pool, claimsForJob(target.id, 'finding', [first.id]), { jobId: staleJob });
+    assert.equal(
+      await queueConsolidatedFindingNotifications(pool, [first]),
+      1,
+      'a reconciled non-delivery makes the finding deliverable again',
+    );
+    return true;
+  });
+  assert.ok(outcome, 'database-backed test ran');
+});
+
+test('historical news receipts are reconciled to the current identity format', { skip: !url }, async () => {
+  const outcome = await withDatabase(async (pool) => {
+    // An old-format accepted job: identity stored without the query string,
+    // payload carrying the original URL.
+    await pool.query(
+      `INSERT INTO outbox(id,dedupe_key,channel,target_id,advisory_id,payload,status,delivery_outcome)
+       VALUES(gen_random_uuid(),'hist-news','email','r1','NEWS:a1',$1::jsonb,'ACCEPTED','ACCEPTED')`,
+      [
+        JSON.stringify({
+          newsEvidence: {
+            articles: [{ id: 'a1', url: 'https://example.com/story?id=100' }],
+          },
+        }),
+      ],
+    );
+    const result = await reconcileHistoricalNewsDeliveries(pool);
+    assert.ok(result.claims >= 1, 'a DELIVERED claim is promoted from the accepted job');
+    const claim = await pool.query<{ state: string }>(
+      "SELECT state FROM delivery_claims WHERE recipient_id='r1' AND kind='article'",
+    );
+    assert.equal(claim.rows.length, 1);
+    assert.equal(claim.rows[0].state, 'DELIVERED');
+    // The promoted identity uses the CURRENT algorithm: query string retained.
+    const identityRow = await pool.query<{ item_id: string }>(
+      "SELECT item_id FROM delivery_claims WHERE recipient_id='r1' AND kind='article'",
+    );
+    assert.match(identityRow.rows[0].item_id, /id=100/, 'the reconciled identity keeps the meaningful query');
+    // The ledger is consistent with the promoted claim.
+    const ledger = await pool.query<{ identity: string }>(
+      "SELECT data->>'identity' AS identity FROM records WHERE kind='newsNotifications' AND data->>'articleId'='a1'",
+    );
+    assert.ok(ledger.rows.length >= 1);
+    assert.match(ledger.rows[0].identity, /id=100/);
+    // Idempotent: a second run promotes nothing new.
+    const second = await reconcileHistoricalNewsDeliveries(pool);
+    assert.equal(second.claims, 0, 'a DELIVERED receipt is never overwritten');
+    // Legacy-format ledger rows without a URL are flagged, not guessed at.
+    await pool.query(
+      `INSERT INTO records(kind,id,data) VALUES('newsNotifications','legacy-1',
+        $1::jsonb) ON CONFLICT (kind,id) DO UPDATE SET data=EXCLUDED.data`,
+      [JSON.stringify({ id: 'legacy-1', recipientId: 'r2', articleId: 'a2', identity: 'url:example.com/old' })],
+    );
+    const third = await reconcileHistoricalNewsDeliveries(pool);
+    assert.equal(third.flagged, 1, 'an unrecoverable legacy identity is flagged for reconciliation');
+    const flagged = await pool.query<{ flagged: string }>(
+      "SELECT data->>'identityLegacy' AS flagged FROM records WHERE kind='newsNotifications' AND id='legacy-1'",
+    );
+    assert.equal(flagged.rows[0].flagged, 'true');
     return true;
   });
   assert.ok(outcome, 'database-backed test ran');

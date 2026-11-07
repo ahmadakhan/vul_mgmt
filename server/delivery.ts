@@ -2499,16 +2499,41 @@ export async function deliverNext(
         [carriedFindingIds, new Date().toISOString()],
       );
     }
-    // A terminally failed delivery never reached the recipient: release the
-    // claims THIS job owns so the next run re-queues the findings instead of
-    // losing them. Ownership is enforced — an expired claim that another job has
-    // since taken is not deleted by the stale owner (audit follow-up, Finding 5).
-    if (job.channel === 'email' && error && failed) {
+    // A terminally failed delivery releases the claims THIS job owns only when
+    // non-delivery is PROVEN (audit follow-up, High #1): the recorded outcome is
+    // the evidence, not the error text.
+    //
+    //   REJECTED      the transport provably refused the message → safe to free;
+    //                 retrying cannot duplicate it.
+    //   NOT_ATTEMPTED the failure happened before any send path (transport
+    //                 attempted flag false) → nothing ever left, safe to free.
+    //   UNKNOWN       the outcome is ambiguous: the provider may have accepted
+    //                 the message before the connection dropped. The claims stay
+    //                 held so no later batch can re-notify the item while the
+    //                 first email may still be in the recipient's inbox. The
+    //                 confirm-prior-delivery path reconciles the outcome with
+    //                 the provider on the next attempt and releases the claims
+    //                 only once non-delivery is established there.
+    const confirmedNonDelivery = deliveryOutcome === 'REJECTED' || deliveryOutcome === 'NOT_ATTEMPTED';
+    if (job.channel === 'email' && error && failed && confirmedNonDelivery) {
       if (carriedFindingIds.length)
         await releaseClaims(db, claimsForJob(job.target_id, 'finding', carriedFindingIds), {
           jobId: job.id,
         });
     }
+    if (job.channel === 'email' && error && failed && !confirmedNonDelivery)
+      await writeEvent(db, {
+        category: 'EMAIL',
+        level: 'WARNING',
+        code: 'delivery.claims_held_pending_outcome',
+        message: 'Terminal failure with an unresolved transport outcome; per-recipient claims held for reconciliation',
+        context: {
+          jobId: job.id,
+          advisoryId: job.advisory_id,
+          deliveryOutcome,
+          claims: carriedFindingIds.length,
+        },
+      });
 // After a Security-team delivery is confirmed ACCEPTED, queue the same
     // email for Everyone-group recipients. This is the deferred half of the
     // `deferEveryoneUntilSecurityDelivered` setting; the function is a no-op when
@@ -2527,11 +2552,26 @@ export async function deliverNext(
         const acceptedAt = new Date().toISOString();
         await recordNewsDeliveries(db, job.target_id, job.advisory_id,
           job.payload.newsEvidence.articles, acceptedAt);
-      } else if (failed) {
+      } else if (failed && confirmedNonDelivery) {
         // The recipient never received these articles: free THIS job's claims so
         // the next run re-queues them instead of losing them. Ownership is
-        // enforced, exactly as for findings.
+        // enforced, exactly as for findings. An UNKNOWN outcome keeps the claims
+        // held, exactly as for findings — the provider may have accepted the
+        // message before the connection failed.
         await releaseClaims(db, articleClaims, { jobId: job.id });
+      } else if (failed) {
+        await writeEvent(db, {
+          category: 'EMAIL',
+          level: 'WARNING',
+          code: 'delivery.claims_held_pending_outcome',
+          message: 'Terminal news failure with an unresolved transport outcome; article claims held for reconciliation',
+          context: {
+            jobId: job.id,
+            advisoryId: job.advisory_id,
+            deliveryOutcome,
+            articles: job.payload.newsEvidence.articles.length,
+          },
+        });
       }
     }
     await writeEvent(db, {

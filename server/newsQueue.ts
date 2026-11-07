@@ -370,3 +370,118 @@ export const newsRecipients = (recipients: readonly EmailRecipient[]) =>
 
 /** Loads enabled recipients once; small table, single query. */
 export const loadNewsRecipients = async (db: Db) => newsRecipients(await list<EmailRecipient>(db, 'recipients'));
+
+interface NewsLedgerEntryWithFlag extends NewsLedgerEntry {
+  /** Set during reconciliation when the original URL is no longer recoverable. */
+  identityLegacy?: boolean;
+}
+
+/**
+ * One-time reconciliation of historical news receipts (AUD-008 / audit
+ * follow-up).
+ *
+ * Older builds wrote ledger identities with the pre-query-string algorithm, and
+ * migration 039 deliberately does NOT backfill news claims — a stored identity
+ * cannot be trusted to match the current format, and guessing would suppress
+ * distinct articles.
+ *
+ * For every ACCEPTED news job still retained in the outbox the original article
+ * URLs survive in the payload. This writes the ledger identity from that
+ * evidence using the CURRENT algorithm and promotes a DELIVERED article claim,
+ * so historical deliveries stay recognised under the new scheme.
+ *
+ * Ledger rows whose original URL is gone (and that do not already match the
+ * current format) are flagged with `identityLegacy` rather than guessed at: they
+ * keep suppressing by article id, and an operator reconciling archives can
+ * resolve the flag once the original URL is known.
+ *
+ * Safe to run repeatedly: ledger updates are idempotent and claims are only
+ * promoted (CLAIMED → DELIVERED), never created over a DELIVERED receipt.
+ */
+export async function reconcileHistoricalNewsDeliveries(
+  db: Db,
+): Promise<{ ledger: number; claims: number; flagged: number }> {
+  const jobs = await db.query<
+    { job_id: string; target_id: string; accepted_at: string | null; article_id: string; url: string }
+  >(
+    `SELECT o.id AS job_id, o.target_id,
+            o.updated_at::text AS accepted_at,
+            entry->>'id' AS article_id, entry->>'url' AS url
+       FROM outbox o
+       CROSS JOIN LATERAL jsonb_array_elements(CASE
+         WHEN jsonb_typeof(o.payload->'newsEvidence'->'articles')='array'
+           THEN o.payload->'newsEvidence'->'articles'
+         WHEN jsonb_typeof(o.payload->'newsEvidence'->'article')='object'
+           THEN jsonb_build_array(o.payload->'newsEvidence'->'article')
+         ELSE '[]'::jsonb END) entry
+      WHERE o.channel='email' AND o.status='ACCEPTED' AND o.payload ? 'newsEvidence'
+        AND COALESCE(entry->>'url','') <> ''`,
+  );
+  let ledger = 0;
+  let claims = 0;
+  let flagged = 0;
+  for (const row of jobs.rows) {
+    const article = { id: row.article_id || '', url: row.url };
+    const canonicalIdentity = newsArticleIdentity(article);
+    const acceptedAt = row.accepted_at || new Date().toISOString();
+    // Write/refresh the ledger row so its identity matches the current format.
+    const ledgerId = newsLedgerRecordId(row.target_id, article);
+    const existing = await get<NewsLedgerEntryWithFlag>(db, NEWS_LEDGER_KIND, ledgerId);
+    if (!existing) {
+      await put(db, NEWS_LEDGER_KIND, ledgerId, {
+        id: ledgerId,
+        recipientId: row.target_id,
+        articleId: article.id,
+        identity: canonicalIdentity,
+        firstNotifiedAt: acceptedAt,
+        lastNotifiedAt: acceptedAt,
+        deliveries: 1,
+        advisoryId: row.job_id,
+      } satisfies NewsLedgerEntryWithFlag);
+      ledger++;
+    } else if (existing.identity !== canonicalIdentity) {
+      await put(db, NEWS_LEDGER_KIND, ledgerId, { ...existing, identity: canonicalIdentity });
+      ledger++;
+    }
+    // DELIVERED article claim. Upsert: insert a receipt when no row exists
+    // (migration 039 excludes news, so this is the common historical case),
+    // promote an existing CLAIMED row held by the accepted job, and never
+    // overwrite an existing DELIVERED receipt.
+    const upserted = await db.query(
+      `INSERT INTO delivery_claims(recipient_id,kind,item_id,state,job_id,claimed_at,delivered_at)
+       VALUES($1,'article',$2,'DELIVERED',$3::uuid,$4::timestamptz,$4::timestamptz)
+       ON CONFLICT (recipient_id,kind,item_id) DO UPDATE SET
+         state='DELIVERED', job_id=EXCLUDED.job_id, delivered_at=EXCLUDED.delivered_at, expires_at=NULL
+        WHERE delivery_claims.state='CLAIMED'
+      RETURNING xmin::text::bigint > 0 AS inserted_new`,
+      [row.target_id, canonicalIdentity, row.job_id, acceptedAt],
+    );
+    claims += upserted.rowCount ?? 0;
+  }
+  // Flag rows this build cannot re-derive: no retained URL and an identity that
+  // predates the query-string change. Reconciling them needs archived evidence.
+  const stale = await db.query<{ id: string; identity: string }>(
+    `SELECT id, data->>'identity' AS identity FROM records
+      WHERE kind=$1
+        AND data->>'identity' LIKE 'url:%'
+        AND data->>'identity' NOT LIKE 'url:%?%'
+        AND COALESCE(data->>'identityLegacy','false') <> 'true'`,
+    [NEWS_LEDGER_KIND],
+  );
+  for (const row of stale.rows) {
+    const existing = await get<NewsLedgerEntryWithFlag>(db, NEWS_LEDGER_KIND, row.id);
+    if (existing) {
+      await put(db, NEWS_LEDGER_KIND, row.id, { ...existing, identityLegacy: true });
+      flagged++;
+    }
+  }
+  if (ledger || claims || flagged)
+    await writeEvent(db, {
+      category: 'EMAIL',
+      level: 'INFO',
+      code: 'delivery.news_history_reconciled',
+      message: 'Historical news receipts reconciled to the current article identity format',
+      context: { ledgerRowsWritten: ledger, claimsPromoted: claims, rowsFlaggedForReconciliation: flagged },
+    });
+  return { ledger, claims, flagged };
+}
